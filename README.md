@@ -2,7 +2,8 @@
 
 The language server for [SQLAKit](https://sqlakit.readthedocs.io/en/stable/)
 templates: the problems `sqlakit check` finds, as you type, completion after
-`tpl.`, hover and go to definition.
+`tpl.`, hover, go to definition, and references: every call of a macro, and
+everything that reads a template.
 
 ```console
 $ pip install sqlakit-lsp

@@ -11,6 +11,7 @@ from sqlakit._sql import sql_macros
 from sqlakit_lsp._server import (
     Completion,
     Diagnostic,
+    Reference,
     Target,
     _Assistant,
     _source_of,
@@ -22,10 +23,21 @@ from sqlakit_lsp._server import (
 PYPROJECT = """
 [project]
 name = "app"
+"""
 
-[tool.sqlakit.templates]
-paths = ["sql"]
-macros = ["lsp_macros", "_macros.sql"]
+DB = """
+import os
+from pathlib import Path
+
+from sqlakit import Database
+from sqlakit.sql import Templates
+
+HERE = Path(__file__).parent
+
+db = Database(
+    os.environ["DATABASE_URL"],
+    templates=Templates(HERE / "sql", macros=[HERE / "_macros.sql"]),
+)
 """
 
 MACROS = '''
@@ -108,6 +120,7 @@ other.sql("not_a_template")
 @pytest.fixture
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (tmp_path / "pyproject.toml").write_text(PYPROJECT)
+    (tmp_path / "db.py").write_text(DB)
     (tmp_path / "lsp_macros.py").write_text(MACROS)
     (tmp_path / "_macros.sql").write_text(SQL_MACROS)
     for name, source in TEMPLATES.items():
@@ -284,10 +297,17 @@ async def test_the_server_answers_an_editor(project: Path) -> None:
         asyncio.get_running_loop().create_future()
     )
 
+    logged: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
     @client.feature(types.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)
     def diagnostics(params: types.PublishDiagnosticsParams) -> None:
         if not published.done():
             published.set_result(params)
+
+    @client.feature(types.WINDOW_LOG_MESSAGE)
+    def log(params: types.LogMessageParams) -> None:
+        if not logged.done():
+            logged.set_result(params.message)
 
     await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
     await client.initialize_async(
@@ -296,6 +316,12 @@ async def test_the_server_answers_an_editor(project: Path) -> None:
         )
     )
     client.initialized(types.InitializedParams())
+    assert (await asyncio.wait_for(logged, 10)).splitlines() == [
+        "templates: sql (db.py:12)",
+        "namespace: tpl (the default)",
+        "macros: 1 in Python, 1 file of SQL macros",
+        "dialect: not in the code, so `sqlakit export` takes --dialect",
+    ]
     uri = (project / "sql" / "new.sql").as_uri()
     client.text_document_did_open(
         types.DidOpenTextDocumentParams(
@@ -332,6 +358,21 @@ async def test_the_server_answers_an_editor(project: Path) -> None:
         for place in places
         if isinstance(place, types.Location)
     ] == [((project / "lsp_macros.py").resolve().as_uri(), 5, 4)] * 3
+
+    referenced = await client.text_document_references_async(
+        types.ReferenceParams(
+            context=types.ReferenceContext(include_declaration=True),
+            text_document=here,
+            position=at,
+        )
+    )
+    assert [
+        (place.uri, place.range.start.line, place.range.start.character)
+        for place in referenced or []
+    ] == [
+        ((project / "lsp_macros.py").resolve().as_uri(), 5, 4),
+        ((project / "sql" / "good.sql").resolve().as_uri(), 1, 10),
+    ]
 
     outer = (project / "sql" / "outer.sql").as_uri()
     client.text_document_did_open(
@@ -476,3 +517,87 @@ def test_a_column_goes_to_the_editor_in_utf16(tmp_path: Path) -> None:
     target = _source_of(macro)
     assert target == Target(path, 0, 21)
     assert _utf16_column(target) == 22
+
+
+HANDLERS = """from db import db
+
+rows = db.sql("inner.sql").all()
+"""
+
+
+def places(project: Path, found: list[Reference]) -> list[tuple[str, str]]:
+    """Each place as its file, and the text it names there."""
+    return [
+        (
+            place.path.relative_to(project).as_posix(),
+            place.path.read_text()[place.start : place.end],
+        )
+        for place in found
+    ]
+
+
+def test_a_macro_is_referenced_by_its_calls(
+    assistant: _Assistant, project: Path
+) -> None:
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+
+    found = assistant.references(good, source, source.index("mine") + 1)
+
+    assert places(project, found) == [("sql/good.sql", "mine")]
+
+
+def test_a_macro_is_referenced_from_where_it_is_defined(
+    assistant: _Assistant, project: Path
+) -> None:
+    python = project / "lsp_macros.py"
+    macros = project / "_macros.sql"
+
+    from_def = assistant.references(
+        python, python.read_text(), python.read_text().index("def mine") + 5
+    )
+    from_alias = assistant.references(
+        macros, macros.read_text(), macros.read_text().index("AS for_team") + 4
+    )
+
+    assert places(project, from_def) == [("sql/good.sql", "mine")]
+    assert places(project, from_alias) == [("_macros.sql", "for_team")]
+
+
+def test_a_template_is_referenced_by_what_reads_it(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(HANDLERS)
+    inner = project / "sql" / "inner.sql"
+    outer = project / "sql" / "outer.sql"
+    expected = [("sql/outer.sql", "inner.sql"), ("handlers.py", "inner.sql")]
+
+    anywhere = assistant.references(inner, inner.read_text(), 3)
+    at_include = assistant.references(
+        outer, outer.read_text(), outer.read_text().index("inner.sql")
+    )
+    at_call = assistant.references(
+        project / "handlers.py", HANDLERS, HANDLERS.index("inner.sql") + 2
+    )
+
+    assert places(project, anywhere) == expected
+    assert places(project, at_include) == expected
+    assert places(project, at_call) == expected
+
+
+def test_references_read_what_the_editor_holds(
+    assistant: _Assistant, project: Path
+) -> None:
+    good = project / "sql" / "good.sql"
+    text = "SELECT tpl.mine(:a), tpl.mine(:b)"
+    first = text.index("mine")
+    second = text.index("mine", first + 1)
+
+    found = assistant.references(
+        good, text, first, lambda path: text if path == good else path.read_text()
+    )
+
+    assert [(place.start, place.end) for place in found] == [
+        (first, first + 4),
+        (second, second + 4),
+    ]

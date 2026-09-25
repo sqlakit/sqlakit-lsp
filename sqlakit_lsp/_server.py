@@ -9,6 +9,8 @@ offers what an editor asks for while a template is written:
   `tpl.include('`, and of the parameters the file already uses after `:`.
 - **Hover** on a macro: how a template calls it, and its docstring.
 - **Definition** of a macro, in its Python module, and of an included template.
+- **References**: every call of a macro, and everything that reads a template,
+  an `include` or a `db.sql(...)`, asked from anywhere in the template.
 
 `_Assistant` reads the text at an offset, and knows nothing of the protocol.
 `serve` turns it into a server.
@@ -22,7 +24,7 @@ import re
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
 from lsprotocol import types
@@ -36,6 +38,9 @@ from sqlakit._sql import (
     signature_of,
 )
 from sqlakit._static import SKIPPED
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 from sqlakit.exceptions import (
     MacroArgumentError,
     MacroSyntaxError,
@@ -83,6 +88,25 @@ class Target:
     path: Path
     line: int
     column: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Reference:
+    """A place that names a macro or a template: a file, and the text's span."""
+
+    path: Path
+    start: int
+    end: int
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+_PYTHON_CALL = re.compile(r"(?<![\w.])tpl\.(\w+)")
+"""A macro called from Python, through the `tpl` object: `tpl.icontains(...)`."""
+
+_WORD = re.compile(r"\w+")
 
 
 class _Assistant:
@@ -222,6 +246,132 @@ class _Assistant:
             (start, end, target)
             for start, end, name in named
             if (target := self.project.path_of(name)) is not None
+        ]
+
+    def references(
+        self,
+        path: Path,
+        source: str,
+        offset: int,
+        read: Callable[[Path], str] = _read,
+    ) -> list[Reference]:
+        """Return every place that names what is under the offset.
+
+        Under a macro, its call or its definition, the places are its calls:
+        in the templates, in the files of SQL macros, and in Python through
+        `tpl`. Under a template's name, in `tpl.include('...')` or in
+        `db.sql("...")`, they are what reads that template. Anywhere else in a
+        template, they are what reads the template itself.
+        """
+        if self.reads_python(path):
+            for start, end, name in _template_names(source):
+                if start <= offset <= end:
+                    return self._template_references(name, read)
+            macro = self._defined_at(path, source, offset)
+            return [] if macro is None else self._macro_references(macro, read)
+        macro = self._macro_at(source, offset) or self._defined_at(path, source, offset)
+        if macro is not None and macro != INCLUDE:
+            return self._macro_references(macro, read)
+        for found in self._include_path.finditer(source):
+            if found.start() <= offset <= found.end():
+                return self._template_references(found.group(1), read)
+        name = self.project.name_of(path)
+        if name is None or self._reads_macros(path):
+            return []
+        return self._template_references(name, read)
+
+    def declaration(self, name: str) -> Reference | None:
+        """Return where a macro's name is written, for a list of its references."""
+        macro = self.project.templates.macros.get(name)
+        if macro is None or (target := _source_of(macro)) is None:
+            return None
+        text = _read(target.path)
+        start = _line_span(text, target.line + 1)[0] + target.column
+        return Reference(target.path, start, start + len(macro.name))
+
+    def macro_named(self, path: Path, source: str, offset: int) -> str | None:
+        """Return the macro under the offset: at a call, or where it is defined."""
+        if not self.reads_python(path):
+            called = self._macro_at(source, offset)
+            if called is not None and called != INCLUDE:
+                return called
+        return self._defined_at(path, source, offset)
+
+    def _defined_at(self, path: Path, source: str, offset: int) -> str | None:
+        """Return the macro whose name the offset is on, where it is defined."""
+        line = source.count("\n", 0, offset) + 1
+        start = source.rfind("\n", 0, offset) + 1
+        end = source.find("\n", offset)
+        words = _WORD.finditer(source, start, len(source) if end < 0 else end)
+        word = next(
+            (
+                found.group().lower()
+                for found in words
+                if found.start() <= offset <= found.end()
+            ),
+            None,
+        )
+        macro = self.project.templates.macros.get(word or "")
+        target = None if macro is None else _source_of(macro)
+        if target is None or target.path.resolve() != path.resolve():
+            return None
+        return word if target.line + 1 == line else None
+
+    def _macro_references(
+        self, name: str, read: Callable[[Path], str]
+    ) -> list[Reference]:
+        found = []
+        for path in self._sql_files():
+            text = read(path)
+            found.extend(
+                Reference(path, match.start(2), match.end(2))
+                for match in self._name_at.finditer(text)
+                if match.group(2).lower() == name
+            )
+        for path in self._python_files():
+            text = read(path)
+            found.extend(
+                Reference(path, match.start(1), match.end(1))
+                for match in _PYTHON_CALL.finditer(text)
+                if match.group(1).lower() == name
+            )
+        return found
+
+    def _template_references(
+        self, name: str, read: Callable[[Path], str]
+    ) -> list[Reference]:
+        found = []
+        for path in self._sql_files():
+            text = read(path)
+            found.extend(
+                Reference(path, match.start(1), match.end(1))
+                for match in self._include_path.finditer(text)
+                if match.group(1) == name
+            )
+        for path in self._python_files():
+            found.extend(
+                Reference(path, start, end)
+                for start, end, named in _template_names(read(path))
+                if named == name
+            )
+        return found
+
+    def _sql_files(self) -> list[Path]:
+        """Every template, and every file of SQL macros."""
+        templates = (
+            self.project.path_of(name) for name in self.project.templates.names()
+        )
+        return [
+            *(path for path in templates if path is not None),
+            *self.project.macro_files(),
+        ]
+
+    def _python_files(self) -> list[Path]:
+        """Every Python file of the project's own."""
+        return [
+            path
+            for path in sorted(self.project.root.rglob("*.py"))
+            if self.reads_python(path)
         ]
 
     def _macro_at(self, source: str, offset: int) -> str | None:
@@ -445,12 +595,18 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
     def initialized(ls: LanguageServer, _: Any) -> None:  # noqa: ANN401
         root = ls.workspace.root_path
         try:
-            state["assistant"] = _Assistant(load_project(Path(root or ".")))
+            project = load_project(Path(root or "."))
         except ProjectConfigError as error:
             state["problem"] = str(error)
             ls.window_show_message(
                 types.ShowMessageParams(types.MessageType.Warning, str(error))
             )
+            return
+        state["assistant"] = _Assistant(project)
+        # What was read, and where from, for an editor's log of the server.
+        ls.window_log_message(
+            types.LogMessageParams(types.MessageType.Info, "\n".join(project.found))
+        )
 
     def publish(ls: LanguageServer, uri: str) -> None:
         document = ls.workspace.get_text_document(uri)
@@ -569,6 +725,39 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         types.TEXT_DOCUMENT_DECLARATION,
     ):
         server.feature(method)(located)
+
+    @server.feature(types.TEXT_DOCUMENT_REFERENCES)
+    def references(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        """Return every place that names the macro or the template under the cursor."""
+        found = at(ls, params)
+        if found is None:
+            return None
+        helper, source, offset = found.helper, found.source, found.offset
+        path = _path(params.text_document.uri)
+        texts: dict[Path, str] = {}
+
+        def read(path: Path) -> str:
+            """Return a file's text, as the editor holds it when it is open."""
+            if path not in texts:
+                held = ls.workspace.text_documents.get(path.resolve().as_uri())
+                texts[path] = held.source if held is not None else _read(path)
+            return texts[path]
+
+        places = helper.references(path, source, offset, read)
+        name = helper.macro_named(path, source, offset)
+        if params.context.include_declaration and name is not None:
+            declared = helper.declaration(name)
+            places = places if declared is None else [declared, *places]
+        return [
+            types.Location(
+                place.path.resolve().as_uri(),
+                types.Range(
+                    types.Position(*position_of(read(place.path), place.start)),
+                    types.Position(*position_of(read(place.path), place.end)),
+                ),
+            )
+            for place in places
+        ]
 
     @server.feature(types.TEXT_DOCUMENT_DOCUMENT_LINK)
     def document_link(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
