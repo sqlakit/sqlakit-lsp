@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_FROZEN: '1'
+
+# Until `sqlakit` releases the version with the templates this server reads,
+# `pyproject.toml` reads it from the directory next to this one, so both are
+# checked out side by side.
+jobs:
+  tests:
+    name: Tests on ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    defaults:
+      run:
+        working-directory: sqlakit-lsp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: sqlakit-lsp
+      - name: Checkout sqlakit
+        uses: actions/checkout@v4
+        with:
+          repository: sqlakit/sqlakit
+          ref: tpl-macros
+          path: sqlakit
+      - name: Install uv and set the Python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync
+      - name: Lint
+        if: matrix.python == '3.11'
+        run: uv run poe lint
+      - name: Run tests
+        run: uv run pytest

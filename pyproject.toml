@@ -1,0 +1,116 @@
+[project]
+name = "sqlakit-lsp"
+version = "0.1.0"
+description = "The language server for SQLAKit templates."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Anton Ruhlov", email = "antonruhlov@gmail.com" }]
+keywords = ["sqlalchemy", "sqlakit", "lsp", "language-server", "sql"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Editors :: Integrated Development Environments (IDE)",
+    "Typing :: Typed",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "sqlakit>=0.20.0",
+    "pygls>=2.0",
+]
+
+[project.scripts]
+sqlakit-lsp = "sqlakit_lsp._cli:main"
+
+[project.urls]
+Repository = "https://github.com/sqlakit/sqlakit-lsp"
+Documentation = "https://sqlakit.readthedocs.io/en/stable/sql/#editor-support"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "sqlakit_lsp"
+module-root = ""
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+# Until `sqlakit` releases the version with the templates this server reads.
+sqlakit = { path = "../sqlakit", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "anyio>=4.14.2",
+    "ty>=0.0.80",
+    "ruff>=0.16.6",
+    "poethepoet>=0.48.0",
+    "codespell>=2.4.3",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "error",
+    # pygls on Python 3.14, until it moves to `inspect.iscoroutinefunction`.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:pygls",
+]
+norecursedirs = [".*", "build", "dist"]
+
+[tool.ruff]
+include = ["sqlakit_lsp/**/*.py", "tests/**/*.py", "pyproject.toml"]
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 79
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "CPY001", # copyright notice in every file
+    "D1", # docstrings are not mandatory
+    "D203", # incompatible with D211
+    "D213", # incompatible with D212
+    "E501", # line length is enforced by the formatter
+    "COM812", # conflicts with the formatter
+    "ISC001", # conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",     # tests assert
+    "PLR2004",  # and compare against the values they mean
+    "SLF001",   # they read the internals they are testing
+    "PLC0415",  # a test imports what it is about, where it is about it
+]
+
+[tool.ty.src]
+include = ["sqlakit_lsp/**/*", "tests/**/*"]
+
+[tool.poe.tasks.fmt]
+help = "Format and auto-fix"
+sequence = ["ruff format", "ruff check --fix"]
+default_item_type = "cmd"
+
+[tool.poe.tasks.test]
+help = "Run the tests"
+cmd = "pytest"
+
+[tool.poe.tasks.lint]
+help = "Lint + type-check"
+sequence = ["ruff format --check", "ruff check", "ty check", "codespell"]
+default_item_type = "cmd"
+
+[tool.codespell]
+skip = "./.venv,./uv.lock,./.git"
