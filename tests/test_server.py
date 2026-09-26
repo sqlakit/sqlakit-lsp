@@ -453,7 +453,7 @@ def test_sql_macros_complete_and_hover_like_the_others(assistant: _Assistant) ->
     ]
     assert assistant.hover("WHERE tpl.for_team(u)", 12) == (
         "```sql\n-- on postgresql\n(u.team = :team)\n```\n\n"
-        "`tpl.for_team(t)`: Rows of the team the call asks for."
+        "```sql\ntpl.for_team(t)\n```\n\nRows of the team the call asks for."
     )
 
 
@@ -839,6 +839,128 @@ def test_hover_shows_the_sql_a_call_writes(assistant: _Assistant) -> None:
         "-- :q not given\n"
         "TRUE\n"
         "```\n\n"
-        "`tpl.if_set(:value, expr[, otherwise])`: `expr` when the parameter holds "
-        "a value, `otherwise` when it does not."
+        "```sql\ntpl.if_set(:value, expr[, otherwise])\n```\n\n"
+        + assistant.project.templates.macros["if_set"].doc
     )
+
+
+def renamed(project: Path, found: object) -> object:
+    """Return a rename as its places, each a file and its text, and its move."""
+    if isinstance(found, str):
+        return found
+    assert isinstance(found, tuple)
+    spans, moved = found
+    return (
+        sorted(places(project, spans)),
+        None
+        if moved is None
+        else tuple(path.relative_to(project).as_posix() for path in moved),
+    )
+
+
+def test_a_macro_is_renamed_where_it_is_defined_and_called(
+    assistant: _Assistant, project: Path
+) -> None:
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+    macros = project / "_macros.sql"
+    sql = macros.read_text()
+
+    python_macro = assistant.rename(good, source, source.index("mine"), "ours")
+    sql_macro = assistant.rename(macros, sql, sql.index("AS for_team") + 4, "by_team")
+
+    assert renamed(project, python_macro) == (
+        [("lsp_macros.py", "mine"), ("sql/good.sql", "mine")],
+        None,
+    )
+    assert renamed(project, sql_macro) == (
+        [("_macros.sql", "for_team"), ("_macros.sql", "for_team")],
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("new", "problem"),
+    [
+        ("if_set", "`if_set` is a macro already."),
+        (
+            "two words",
+            "A macro's name is a word of letters, digits and `_`: `two words` is not.",
+        ),
+    ],
+)
+def test_a_rename_that_cannot_be_done_says_why(
+    assistant: _Assistant, project: Path, new: str, problem: str
+) -> None:
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+
+    assert assistant.rename(good, source, source.index("mine"), new) == problem
+    assert assistant.renamable(good, source, source.index("if_set")) == (
+        "`if_set` is built in, and keeps its name."
+    )
+
+
+def test_a_template_is_renamed_with_everything_that_reads_it(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(HANDLERS)
+    outer = project / "sql" / "outer.sql"
+    source = outer.read_text()
+    at = source.index("inner.sql")
+
+    found = assistant.rename(outer, source, at, "reads/inner.sql")
+
+    assert assistant.renamable(outer, source, at) == (at, at + len("inner.sql"))
+    assert renamed(project, found) == (
+        [("handlers.py", "inner.sql"), ("sql/outer.sql", "inner.sql")],
+        ("sql/inner.sql", "sql/reads/inner.sql"),
+    )
+    assert (
+        assistant.rename(outer, source, at, "good.sql")
+        == "`good.sql` is a template already."
+    )
+
+
+@pytest.mark.anyio
+async def test_a_rename_reaches_the_editor_as_one_edit(project: Path) -> None:
+    from lsprotocol import types
+    from pygls.exceptions import JsonRpcException
+    from pygls.lsp.client import LanguageClient
+
+    client = LanguageClient("test", "1")
+    await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    await client.initialize_async(
+        types.InitializeParams(
+            capabilities=types.ClientCapabilities(), root_uri=project.as_uri()
+        )
+    )
+    client.initialized(types.InitializedParams())
+    outer = project / "sql" / "outer.sql"
+    text = outer.read_text()
+    here = types.TextDocumentIdentifier(outer.as_uri())
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(
+            types.TextDocumentItem(outer.as_uri(), "sql", 1, text)
+        )
+    )
+    at = types.Position(*position_of(text, text.index("inner.sql")))
+
+    edit = await client.text_document_rename_async(
+        types.RenameParams(here, at, "reads/inner.sql")
+    )
+    with pytest.raises(JsonRpcException, match="Rename a macro, or the name"):
+        await client.text_document_prepare_rename_async(
+            types.PrepareRenameParams(here, types.Position(1, 5))
+        )
+
+    assert edit is not None
+    changes = edit.document_changes or []
+    [moved] = [one for one in changes if isinstance(one, types.RenameFile)]
+    assert (moved.old_uri, moved.new_uri) == (
+        (project / "sql" / "inner.sql").resolve().as_uri(),
+        (project / "sql" / "reads" / "inner.sql").resolve().as_uri(),
+    )
+    await client.shutdown_async(None)
+    client.exit(None)
+    await client.stop()

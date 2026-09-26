@@ -32,6 +32,7 @@ import sqlalchemy as sa
 import sqlalchemy.engine.default
 import sqlalchemy.exc
 from lsprotocol import types
+from pygls.exceptions import JsonRpcException
 from pygls.lsp.server import LanguageServer
 from sqlakit._project import Project, load_project
 from sqlakit._sql import (
@@ -43,7 +44,7 @@ from sqlakit._sql import (
     signature_of,
     sql_macros,
 )
-from sqlakit._static import SKIPPED
+from sqlakit._static import SKIPPED, StaticMacro
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -152,6 +153,15 @@ def _open_brackets(source: str, start: int, end: int) -> list[tuple[int, int]]:
             opened[-1][1] += 1
         index += 1
     return [(bracket, commas) for bracket, commas in opened]
+
+
+class RequestFailed(JsonRpcException):
+    """A request the project cannot answer, such as a rename it cannot take.
+
+    The editor shows the message.
+    """
+
+    CODE = -32803
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,8 +318,7 @@ class _Assistant:
         written = self.written(source, offset)
         if not written:
             return f"```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
-        summary = macro.doc.split("\n\n", 1)[0].replace("\n", " ")
-        return f"```sql\n{written}\n```\n\n`{signature}`: {summary}".rstrip()
+        return f"```sql\n{written}\n```\n\n```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
 
     def written(self, source: str, offset: int) -> str:
         """Return the SQL the call under the offset writes, on the project's dialect.
@@ -601,6 +610,114 @@ class _Assistant:
         if name is None or self._reads_macros(path):
             return []
         return self._references(held, templates=name)
+
+    def renamable(self, path: Path, source: str, offset: int) -> tuple[int, int] | str:
+        """Return the span a rename starts from, or why nothing there renames."""
+        for start, end, _ in self._names_in(path, source):
+            if start <= offset <= end:
+                return start, end
+        name = self.macro_named(path, source, offset)
+        if name is None:
+            return "Rename a macro, or the name of a template in a call that reads it."
+        problem = self._definitions(name)
+        if isinstance(problem, str):
+            return problem
+        span = _word_at(source, offset)
+        return span if span is not None else (offset, offset)
+
+    def rename(
+        self,
+        path: Path,
+        source: str,
+        offset: int,
+        new: str,
+        held: Mapping[Path, str] | None = None,
+    ) -> tuple[list[Reference], tuple[Path, Path] | None] | str:
+        """Return what a rename changes, or why it cannot be done.
+
+        That is each span to write the new name into, and a template's file to
+        move from one path to the other.
+        """
+        held = held or {}
+        for start, end, name in self._names_in(path, source):
+            if start <= offset <= end:
+                return self._rename_template(name, new, held)
+        name = self.macro_named(path, source, offset)
+        if name is None:
+            return "Rename a macro, or the name of a template in a call that reads it."
+        return self._rename_macro(name, new, held)
+
+    def _names_in(self, path: Path, source: str) -> list[tuple[int, int, str]]:
+        """Return each template the text names, and where the name is."""
+        if self.reads_python(path):
+            return _template_names(source)
+        return [
+            (found.start(1), found.end(1), found.group(1))
+            for found in self._include_path.finditer(source)
+        ]
+
+    def _rename_template(
+        self, name: str, new: str, held: Mapping[Path, str]
+    ) -> tuple[list[Reference], tuple[Path, Path] | None] | str:
+        old = self.project.path_of(name)
+        if old is None:
+            return f"No SQL template named `{name}`."
+        if not new.endswith(".sql"):
+            return f"A template's name ends in `.sql`: `{new}` does not."
+        if self.project.path_of(new) is not None:
+            return f"`{new}` is a template already."
+        root = next(
+            Path(root)
+            for root in self.project.templates.paths
+            if old.resolve().is_relative_to(Path(root).resolve())
+        )
+        return self._references(held, templates=name), (old, root / new)
+
+    def _rename_macro(
+        self, name: str, new: str, held: Mapping[Path, str]
+    ) -> tuple[list[Reference], tuple[Path, Path] | None] | str:
+        definitions = self._definitions(name)
+        if isinstance(definitions, str):
+            return definitions
+        if not re.fullmatch(r"[A-Za-z_]\w*", new):
+            return (
+                f"A macro's name is a word of letters, digits and `_`: `{new}` is not."
+            )
+        if new.lower() in self.project.templates.macros or new.lower() == INCLUDE:
+            return f"`{new}` is a macro already."
+        return [*definitions, *self._references(held, macro=name)], None
+
+    def _definitions(self, name: str) -> list[Reference] | str:
+        """Return where a macro of the project names itself, or why it cannot be renamed.
+
+        That is the `def` of a Python macro, the `AS name` of an SQL one, and both
+        for `@sql_macro("file.sql")`.
+        """
+        macro = self.project.templates.macros.get(name)
+        if not isinstance(macro, StaticMacro | SqlMacro):
+            return f"`{name}` is built in, and keeps its name."
+        found = []
+        declared = self.declaration(name)
+        if declared is not None:
+            found.append(declared)
+        sql = getattr(macro, "sql_path", None)
+        if sql is not None:
+            statement = next(
+                (one for one in sql_macros(Path(sql)) if one.name == name), None
+            )
+            if statement is not None:
+                text = _read(Path(sql))
+                line, column = statement.name_at
+                start = _line_span(text, line)[0] + column
+                found.append(Reference(Path(sql), start, start + len(name)))
+        for place in found:
+            written = _read(place.path)[place.start : place.end]
+            if written.lower() != name:
+                return (
+                    f"`{name}` is named in its decorator, not by its function: "
+                    f"rename it there"
+                )
+        return found
 
     def declaration(self, name: str) -> Reference | None:
         """Return where a macro's name is written, for a list of its references."""
@@ -1263,6 +1380,70 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             )
             for place in places
         ]
+
+    def held(ls: LanguageServer) -> dict[Path, str]:
+        """Return the text of every file the editor has open, by its path."""
+        return {
+            _path(uri).resolve(): document.source
+            for uri, document in ls.workspace.text_documents.items()
+        }
+
+    @server.feature(types.TEXT_DOCUMENT_PREPARE_RENAME)
+    def prepare_rename(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        found = at(ls, params)
+        if found is None:
+            return None
+        path = _path(params.text_document.uri)
+        span = found.helper.renamable(path, found.source, found.offset)
+        if isinstance(span, str):
+            raise RequestFailed(span)
+        return types.Range(
+            types.Position(*position_of(found.source, span[0])),
+            types.Position(*position_of(found.source, span[1])),
+        )
+
+    @server.feature(types.TEXT_DOCUMENT_RENAME)
+    def rename(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        found = at(ls, params)
+        if found is None:
+            return None
+        texts = held(ls)
+        path = _path(params.text_document.uri)
+        renamed = found.helper.rename(
+            path, found.source, found.offset, params.new_name, texts
+        )
+        if isinstance(renamed, str):
+            raise RequestFailed(renamed)
+        places, moved = renamed
+        by_file: dict[Path, list[Reference]] = {}
+        for place in places:
+            by_file.setdefault(place.path.resolve(), []).append(place)
+
+        def text_of(path: Path) -> str:
+            return texts[path] if path in texts else _read(path)
+
+        changes: list[Any] = [
+            types.TextDocumentEdit(
+                types.OptionalVersionedTextDocumentIdentifier(file.as_uri(), None),
+                [
+                    types.TextEdit(
+                        types.Range(
+                            types.Position(*position_of(text_of(file), one.start)),
+                            types.Position(*position_of(text_of(file), one.end)),
+                        ),
+                        params.new_name,
+                    )
+                    for one in edits
+                ],
+            )
+            for file, edits in by_file.items()
+        ]
+        if moved is not None:
+            old, new = moved
+            changes.append(
+                types.RenameFile(old.resolve().as_uri(), new.resolve().as_uri())
+            )
+        return types.WorkspaceEdit(document_changes=changes)
 
     @server.feature(types.TEXT_DOCUMENT_DOCUMENT_LINK)
     def document_link(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
