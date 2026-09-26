@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Go to definition on a built-in macro opens the `sqlakit` in the project's
+  `.venv`, when it's the version the server runs. A server that `uvx` runs
+  opened its own copy in uv's cache, where the project's settings don't apply.
+
 ## 0.1.1
 
 - Runs with `sqlakit` 0.22 as well as 0.21.

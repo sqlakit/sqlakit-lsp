@@ -27,12 +27,13 @@ import re
 import tempfile
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from functools import lru_cache
+from dataclasses import dataclass, field, replace
+from functools import cached_property, lru_cache
 from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import sqlakit
 import sqlalchemy as sa
 import sqlalchemy.engine.default
 import sqlalchemy.exc
@@ -421,6 +422,34 @@ class _Assistant:
         resolved = path.resolve()
         return any(resolved in files for files in self._files)
 
+    def _source(self, macro: Macro) -> Target | None:
+        """Return where a macro is written, in the project's own `sqlakit`.
+
+        A server that `uvx` runs imports `sqlakit` from a cache of its own. The
+        project holds the same version in `.venv`, which is the file to open.
+        """
+        target = _source_of(macro)
+        if target is None or self._library is None:
+            return target
+        try:
+            inside = target.path.resolve().relative_to(_LIBRARY)
+        except ValueError:
+            return target
+        return replace(target, path=self._library / inside)
+
+    @cached_property
+    def _library(self) -> Path | None:
+        """Return the project's `sqlakit` in `.venv`, when it is this version."""
+        installed = f"sqlakit-{version('sqlakit')}.dist-info"
+        for site in (
+            *self._root.glob(".venv/lib/python*/site-packages"),
+            self._root / ".venv/Lib/site-packages",
+        ):
+            library = site / "sqlakit"
+            if (site / installed).is_dir() and library.resolve() != _LIBRARY:
+                return library
+        return None
+
     def owns(self, path: Path) -> bool:
         """Whether a file is the project's own, where `walk` goes.
 
@@ -460,7 +489,7 @@ class _Assistant:
             self._sources = {
                 target.path.resolve()
                 for macro in self.project.templates.macros.values()
-                if (target := _source_of(macro)) is not None
+                if (target := self._source(macro)) is not None
             }
         return path.resolve() in self._sources
 
@@ -688,7 +717,7 @@ class _Assistant:
                     signature_of(macro, namespace),
                 )
                 for macro in self.project.templates.macros.values()
-                if (target := _source_of(macro)) is not None
+                if (target := self._source(macro)) is not None
             ]
             everything.extend(
                 (name, "template", Target(path, 0), "")
@@ -942,7 +971,7 @@ class _Assistant:
                 return None if path is None else Target(path, 0)
         macro = self.project.templates.macros.get(self._macro_at(source, offset) or "")
         if macro is not None:
-            return _source_of(macro)
+            return self._source(macro)
         if path is None:
             return None
         # The SQL of `@sql_macro("file.sql")` goes to its function.
@@ -963,7 +992,7 @@ class _Assistant:
         if macro is None or sql is None:
             return None
         if Path(sql).resolve() == path.resolve():
-            return _source_of(macro)
+            return self._source(macro)
         statement = next(
             (one for one in sql_macros(Path(sql)) if one.name == macro.name), None
         )
@@ -1271,7 +1300,7 @@ class _Assistant:
     def declaration(self, name: str) -> Reference | None:
         """Return where a macro's name is written, for a list of its references."""
         macro = self.project.templates.macros.get(name)
-        if macro is None or (target := _source_of(macro)) is None:
+        if macro is None or (target := self._source(macro)) is None:
             return None
         text = _read(target.path)
         start = _line_span(text, target.line + 1)[0] + target.column
@@ -1300,7 +1329,7 @@ class _Assistant:
         sql = getattr(macro, "sql_path", None)
         if sql is not None and Path(sql).resolve() == path.resolve():
             return word
-        target = _source_of(macro)
+        target = self._source(macro)
         if target is None or target.path.resolve() != path.resolve():
             return None
         return word if target.line + 1 == line else None
@@ -1672,6 +1701,9 @@ def _source_of(macro: Macro) -> Target | None:
 
 
 _DEF = re.compile(r"\s*(?:async\s+)?def\s+(\w+)")
+
+_LIBRARY = Path(sqlakit.__file__).resolve().parent
+"""The `sqlakit` this server imports."""
 
 
 @dataclass(frozen=True, slots=True)
