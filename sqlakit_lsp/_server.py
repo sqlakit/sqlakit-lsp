@@ -77,6 +77,8 @@ class Diagnostic:
     start: int
     end: int
     message: str
+    severity: str = "error"
+    """`error`, `warning`, or `hint` for what is likely fine."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +321,8 @@ class _Assistant:
         }
         """The files `@sql_macro("file.sql")` keeps its SQL in."""
         self._sources: set[Path] | None = None
+        self._passed: dict[str, frozenset[str] | None] = {}
+        self._including: dict[str, set[str]] | None = None
         self._everything: list[tuple[str, str, Target, str]] | None = None
         self._compiles: OrderedDict[tuple[str, str], Any] = OrderedDict()
         self._names: list[str] | None = None
@@ -361,7 +365,8 @@ class _Assistant:
 
     def forget_files(self) -> None:
         """Read the list of templates and Python files again on the next request."""
-        self._names = self._files = self._everything = None
+        self._names = self._files = self._everything = self._including = None
+        self._passed.clear()
 
     def names(self) -> list[str]:
         """Every template's name, read once until `forget_files`."""
@@ -403,7 +408,85 @@ class _Assistant:
             self.compiled(name, source)
         except (MacroSyntaxError, UnknownMacroError, MacroArgumentError) as error:
             return [self._placed(error, name, source)]
-        return [Diagnostic(*found) for found in self.project.foreign_calls(source)]
+        found = [Diagnostic(*one) for one in self.project.foreign_calls(source)]
+        if (template := self._last_compiled(name, source)) is not None:
+            found.extend(self.unpassed(name, source, template))
+        return found
+
+    def _last_compiled(self, name: str, source: str) -> MacroTemplate | None:
+        """Return the template `diagnose` has just read, from the cache."""
+        found = self._compiles.get((name, source))
+        return found if isinstance(found, MacroTemplate) else None
+
+    def unpassed(
+        self, name: str, source: str, template: MacroTemplate
+    ) -> list[Diagnostic]:
+        """Return each parameter of a template that no call of the project passes.
+
+        One close to a name the calls do pass is likely a typo, and a warning.
+        Any other is a hint: a template may offer what no call uses yet. Nothing
+        is said when no call reads the template, or one passes values it does
+        not name, `**values` or a context.
+        """
+        passed = self.passed(name)
+        if passed is None:
+            return []
+        listed = ", ".join(f"`{one}`" for one in sorted(passed)) or "nothing"
+        found = []
+        for param in sorted(template.parameters() - passed):
+            written = re.search(rf"(?<![:\w\\]):{re.escape(param)}\b", source)
+            if written is None:
+                continue
+            if difflib.get_close_matches(param, passed, n=1, cutoff=0.6):
+                message = f"No call passes `:{param}`, and the calls pass {listed}."
+                found.append(Diagnostic(*written.span(), message, "warning"))
+            else:
+                message = f"No call in the project's Python passes `:{param}`."
+                found.append(Diagnostic(*written.span(), message, "hint"))
+        return found
+
+    def passed(self, name: str) -> frozenset[str] | None:
+        """Return every name the calls that read a template pass, or None.
+
+        The calls are those of Python that read it, and those that read a
+        template that includes it, however deep. None when there is no call,
+        or one passes values it does not name. Kept until files change.
+        """
+        if name in self._passed:
+            return self._passed[name]
+        included_by = self._included_by()
+        readers, waiting = {name}, [name]
+        while waiting:
+            for including in included_by.get(waiting.pop(), ()):
+                if including not in readers:
+                    readers.add(including)
+                    waiting.append(including)
+        calls = [
+            call
+            for path in self._project_files()[1]
+            for reader in readers
+            for call in self._scan(path, None).calls.get(reader, ())
+        ]
+        passed = (
+            None
+            if not calls or any(call.open for call in calls)
+            else frozenset(keyword for call in calls for keyword, _, _ in call.keywords)
+        )
+        self._passed[name] = passed
+        return passed
+
+    def _included_by(self) -> dict[str, set[str]]:
+        """Return, for each template, the templates that include it."""
+        if self._including is None:
+            including: dict[str, set[str]] = {}
+            for path in self._project_files()[0]:
+                reader = self.project.name_of(path)
+                if reader is None:
+                    continue
+                for included in self._scan(path, None).templates:
+                    including.setdefault(included, set()).add(reader)
+            self._including = including
+        return self._including
 
     def compiled(self, name: str, source: str) -> MacroTemplate:
         """Return a template read from its text, reading each text once.
@@ -538,8 +621,18 @@ class _Assistant:
                 return []
             names = [*self.project.templates.macros, INCLUDE]
             return _similar(found.group(2), names, *found.span(2), namespace)
+        return self._names_fixes(text, start, end, message)
+
+    def _names_fixes(self, text: str, start: int, end: int, message: str) -> list[Fix]:
+        """Return the names close to a template's or a parameter's written."""
         if message.startswith("No SQL template named"):
             return _similar(text, self.names(), start, end)
+        if message.startswith("No call passes `:"):
+            passed = re.findall(r"`(\w+)`", message.split("the calls pass", 1)[1])
+            return [
+                Fix(f"Write `:{name}`", start, end, f":{name}")
+                for name in difflib.get_close_matches(text[1:], passed, n=3, cutoff=0.6)
+            ]
         if (named := _NOT_READ.match(message)) is not None:
             reads = self.parameters(named.group("template")) or frozenset()
             return _similar(text, sorted(reads), start, end)
@@ -1291,6 +1384,25 @@ class _TemplateCall:
     """Where the template's name is written, without its quotes."""
 
 
+def _named_keys(
+    node: ast.expr, source: str, starts: list[int]
+) -> list[tuple[str, int, int]] | None:
+    """Return the keys of a dict written out, and where each is, or None.
+
+    None is a context the code does not write out: a name, a call, or a dict
+    with `**` in it.
+    """
+    if not isinstance(node, ast.Dict) or any(key is None for key in node.keys):
+        return None
+    found = []
+    for key in node.keys:
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            return None
+        start = _char_offset(source, starts, key.lineno, key.col_offset) + 1
+        found.append((key.value, start, start + len(key.value)))
+    return found
+
+
 def _template_calls(source: str) -> list[_TemplateCall]:
     """Return each call of `.sql(...)`, `.from_file(...)` or `.from_sql(...)`."""
     if not _TEMPLATE_CALL_NAMED.search(source):
@@ -1320,6 +1432,14 @@ def _template_calls(source: str) -> list[_TemplateCall]:
                 continue
             start = _char_offset(source, starts, keyword.lineno, keyword.col_offset)
             keywords.append((keyword.arg, start, start + len(keyword.arg)))
+        # A context written out as a dict names its values as keywords do.
+        contexts = [
+            *node.args[1:2],
+            *(keyword.value for keyword in node.keywords if keyword.arg == "context"),
+        ]
+        written = [_named_keys(context, source, starts) for context in contexts]
+        for keys in written:
+            keywords.extend(keys or ())
         named = node.args[0]
         value = str(named.value) if isinstance(named, ast.Constant) else ""
         span = None
@@ -1332,8 +1452,9 @@ def _template_calls(source: str) -> list[_TemplateCall]:
             _TemplateCall(
                 value,
                 tuple(keywords),
-                len(node.args) > 1
-                or any(keyword.arg in (None, "context") for keyword in node.keywords),
+                any(keys is None for keys in written)
+                or len(node.args) > 2  # noqa: PLR2004 - the name and a context
+                or any(keyword.arg is None for keyword in node.keywords),
                 node.lineno,
                 span,
             )
@@ -2055,13 +2176,20 @@ def _utf16_column(target: Target) -> int:
     return len(line[: target.column].encode("utf-16-le")) // 2
 
 
+_SEVERITIES = {
+    "error": types.DiagnosticSeverity.Error,
+    "warning": types.DiagnosticSeverity.Warning,
+    "hint": types.DiagnosticSeverity.Hint,
+}
+
+
 def _diagnostic(source: str, found: Diagnostic) -> types.Diagnostic:
     start = types.Position(*position_of(source, found.start))
     end = types.Position(*position_of(source, max(found.end, found.start)))
     return types.Diagnostic(
         range=types.Range(start, end),
         message=found.message,
-        severity=types.DiagnosticSeverity.Error,
+        severity=_SEVERITIES[found.severity],
         source="sqlakit",
     )
 

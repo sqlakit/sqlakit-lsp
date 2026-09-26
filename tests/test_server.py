@@ -845,7 +845,7 @@ def test_a_file_macro_goes_between_its_function_and_its_sql(project: Path) -> No
 def test_a_value_the_template_does_not_read_is_marked(assistant: _Assistant) -> None:
     code = 'db.sql("good.sql", teams=[1], teem=1)\n'
     passes_through = (
-        'db.sql("good.sql", **values)\ndb.sql("good.sql", {"q": 1}, teem=1)\n'
+        'db.sql("good.sql", **values)\ndb.sql("good.sql", context, teem=1)\n'
     )
 
     [found] = assistant.python_diagnose(code)
@@ -1383,3 +1383,69 @@ async def test_a_quick_fix_comes_with_the_problem_it_fixes(project: Path) -> Non
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()
+
+
+def test_a_parameter_no_call_passes_is_marked(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(
+        "from db import db\n\n"
+        'one = db.sql("outer.sql", teams=[1]).all()\n'
+        'two = db.sql("inner.sql", x=1).all()\n'
+    )
+    (project / "sql" / "inner.sql").write_text("SELECT id FROM t WHERE id = :x")
+    assistant.forget_files()
+    inner = project / "sql" / "inner.sql"
+    typo = "SELECT id FROM t WHERE team IN (:teem) AND id = :x LIMIT :limit"
+
+    found = assistant.diagnose(inner, typo)
+
+    assert [
+        (typo[one.start : one.end], one.severity, one.message) for one in found
+    ] == [
+        (":limit", "hint", "No call in the project's Python passes `:limit`."),
+        (
+            ":teem",
+            "warning",
+            "No call passes `:teem`, and the calls pass `teams`, `x`.",
+        ),
+    ]
+    [warning] = [one for one in found if one.severity == "warning"]
+    assert fixed(
+        typo, assistant.fixes(typo, warning.start, warning.end, warning.message)
+    ) == [
+        ("Write `:teams`", typo.replace(":teem", ":teams")),
+    ]
+
+
+def test_nothing_is_marked_when_a_call_passes_values_it_does_not_name(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(
+        'from db import db\n\nrows = db.sql("good.sql", **values).all()\n'
+    )
+    assistant.forget_files()
+    good = project / "sql" / "good.sql"
+
+    assert assistant.diagnose(good, good.read_text() + " AND :other") == []
+
+
+def test_a_context_written_out_names_its_values_as_keywords_do(
+    assistant: _Assistant, project: Path
+) -> None:
+    code = (
+        'db.sql("good.sql", {"teams": [1], "qq": 1})\n'
+        'db.sql("good.sql", context={"q": 1})\n'
+        'db.sql("good.sql", context)\n'
+    )
+    good = project / "sql" / "good.sql"
+    (project / "handlers.py").write_text(code.replace("context)\n", "{})\n"))
+    assistant.forget_files()
+
+    found = assistant.python_diagnose(code)
+
+    assert [(code[one.start : one.end], one.message) for one in found] == [
+        ("qq", "`qq` is not a parameter of `good.sql`, which reads `q`, `teams`.")
+    ]
+    assert assistant.passed("good.sql") == {"teams", "qq", "q"}
+    assert assistant.diagnose(good, good.read_text()) == []
