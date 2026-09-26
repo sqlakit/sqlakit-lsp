@@ -4,12 +4,14 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import pytest
 from sqlakit._project import load_project
 from sqlakit._sql import sql_macros
 
 from sqlakit_lsp._server import (
+    RENDER,
     Completion,
     Diagnostic,
     Reference,
@@ -1037,3 +1039,116 @@ def test_a_built_in_macro_is_referenced_from_its_def(
     assert assistant.python_definition(source, at, library) == Target(
         library, source.count("\n", 0, at), len("def ")
     )
+
+
+def test_a_text_is_read_once_whatever_asks_for_it(
+    assistant: _Assistant, project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loads: list[str] = []
+    project_type = type(assistant.project)
+    load = project_type.load
+
+    def counted(self: object, name: str, source: str) -> object:
+        loads.append(source)
+        return load(self, name, source)  # ty: ignore[invalid-argument-type]
+
+    monkeypatch.setattr(project_type, "load", counted)
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+    broken = "SELECT tpl.nope(1)"
+
+    assistant.diagnose(good, source)
+    assistant.hover(source, source.index("if_set"), good)
+    assistant.diagnose(good, source)
+    assistant.diagnose(good, broken)
+    assistant.diagnose(good, broken)
+
+    assert loads.count(source) == 1
+    assert loads.count(broken) == 1
+
+
+def test_a_template_is_read_again_when_what_it_includes_changes(
+    assistant: _Assistant, project: Path
+) -> None:
+    outer = project / "sql" / "outer.sql"
+    inner = project / "sql" / "inner.sql"
+    inner.write_text("SELECT 1 AS id")
+    source = outer.read_text()
+    first = assistant.compiled("outer.sql", source)
+
+    inner.write_text("SELECT 2 AS id")
+    os.utime(inner, (inner.stat().st_atime, inner.stat().st_mtime + 1))
+
+    assert assistant.compiled("outer.sql", source) is not first
+    assert assistant.compiled("outer.sql", source) is assistant.compiled(
+        "outer.sql", source
+    )
+
+
+def test_a_whole_template_renders_with_its_parameters_given_or_not(
+    assistant: _Assistant, project: Path
+) -> None:
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+
+    given = assistant.rendered(good, source, given=True)
+    none = assistant.rendered(good, source, given=False)
+
+    assert given.splitlines()[0] == "-- good.sql on postgresql, :q, :teams given"
+    assert "tpl.mine(:teams)" in given
+    assert "name = :q" in given
+    assert none.splitlines()[0] == "-- good.sql on postgresql, :q, :teams not given"
+    assert "name = :q" not in none
+
+
+@pytest.mark.anyio
+async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
+    from lsprotocol import types
+    from pygls.lsp.client import LanguageClient
+
+    client = LanguageClient("test", "1")
+    shown: list[str] = []
+
+    @client.feature(types.WINDOW_SHOW_DOCUMENT)
+    def show(params: types.ShowDocumentParams) -> types.ShowDocumentResult:
+        shown.append(params.uri)
+        return types.ShowDocumentResult(success=True)
+
+    await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    await client.initialize_async(
+        types.InitializeParams(
+            capabilities=types.ClientCapabilities(), root_uri=project.as_uri()
+        )
+    )
+    client.initialized(types.InitializedParams())
+    good = project / "sql" / "good.sql"
+    uri = good.as_uri()
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(
+            types.TextDocumentItem(uri, "sql", 1, good.read_text())
+        )
+    )
+
+    actions = await client.text_document_code_action_async(
+        types.CodeActionParams(
+            types.TextDocumentIdentifier(uri),
+            types.Range(types.Position(0, 0), types.Position(0, 0)),
+            types.CodeActionContext(diagnostics=[]),
+        )
+    )
+    assert [action.title for action in actions or []] == [
+        "Show rendered SQL, parameters given",
+        "Show rendered SQL, no parameters",
+    ]
+    await client.workspace_execute_command_async(
+        types.ExecuteCommandParams(RENDER, [uri, True])
+    )
+
+    [opened] = shown
+    written = Path(unquote(urlparse(opened).path))
+    assert written.name == "good.sql"
+    text = await asyncio.to_thread(written.read_text)
+    assert text.startswith("-- good.sql on postgresql, :q, :teams given")
+    await client.shutdown_async(None)
+    client.exit(None)
+    await client.stop()

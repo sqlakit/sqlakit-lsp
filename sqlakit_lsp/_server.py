@@ -22,6 +22,8 @@ import ast
 import asyncio
 import inspect
 import re
+import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import version
@@ -40,12 +42,13 @@ from sqlakit._sql import (
     INCLUDE,
     Context,
     Macro,
+    MacroTemplate,
     Param,
     SqlMacro,
     signature_of,
     sql_macros,
 )
-from sqlakit._static import SKIPPED, StaticMacro
+from sqlakit._static import SKIPPED, StaticMacro, written_as_called
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -111,9 +114,13 @@ def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
 
 
 def _rendered(template: Any, dialect: str, values: dict[str, Any]) -> str | None:  # noqa: ANN401
-    """Return the SQL a read template writes for these values, if it can."""
+    """Return the SQL a read template writes for these values, if it can.
+
+    A macro of the project's own Python is read, not run, so it stays a call.
+    """
     try:
-        return template.render(Context(dialect, _preparer(dialect), values)).strip()
+        with written_as_called(template.namespace):
+            return template.render(Context(dialect, _preparer(dialect), values)).strip()
     except Exception:  # noqa: BLE001 - a macro may want a value of its own kind
         return None
 
@@ -203,6 +210,16 @@ _PYTHON_CALL = re.compile(r"(?<![\w.])tpl\.(\w+)")
 
 _WORD = re.compile(r"\w+")
 
+RENDER = "sqlakit.render"
+"""The command that writes a whole template as SQL, for an editor to open."""
+
+_RENDERED = Path(tempfile.gettempdir()) / "sqlakit-rendered"
+"""Where rendered templates are written: outside the project, as they are
+nothing to keep."""
+
+_COMPILES = 64
+"""How many texts of templates stay read: the ones the editor has open, mostly."""
+
 
 def _word_at(source: str, offset: int) -> tuple[int, int] | None:
     """Return the span of the word the offset is in or next to."""
@@ -235,6 +252,7 @@ class _Assistant:
         }
         """The files `@sql_macro("file.sql")` keeps its SQL in."""
         self._sources: set[Path] | None = None
+        self._compiles: OrderedDict[tuple[str, str], Any] = OrderedDict()
         self._names: list[str] | None = None
         self._files: tuple[list[Path], list[Path]] | None = None
         self._scans: dict[Path, _Scan] = {}
@@ -314,10 +332,68 @@ class _Assistant:
             return []
         name = self.project.name_of(path) or path.name
         try:
-            self.project.load(name, source)
+            self.compiled(name, source)
         except (MacroSyntaxError, UnknownMacroError, MacroArgumentError) as error:
             return [self._placed(error, name, source)]
         return [Diagnostic(*found) for found in self.project.foreign_calls(source)]
+
+    def compiled(self, name: str, source: str) -> MacroTemplate:
+        """Return a template read from its text, reading each text once.
+
+        Diagnostics, hover and the parameters of a call all ask for the text the
+        editor holds, often the same one. A template read before is read again
+        when a template it includes has changed on disk.
+
+        Raises:
+            SQLAKitError: whatever reading the template raises, raised again.
+
+        """
+        key = (name, source)
+        found = self._compiles.get(key)
+        if isinstance(found, MacroTemplate) and not self._includes_changed(found):
+            self._compiles.move_to_end(key)
+            return found
+        if isinstance(found, SQLAKitError):
+            self._compiles.move_to_end(key)
+            raise found
+        try:
+            found = self.project.load(name, source)
+        except SQLAKitError as error:
+            found = error
+        self._compiles[key] = found
+        while len(self._compiles) > _COMPILES:
+            self._compiles.popitem(last=False)
+        if isinstance(found, SQLAKitError):
+            raise found
+        return found
+
+    def _includes_changed(self, template: MacroTemplate) -> bool:
+        for included, mtime in template.includes.items():
+            path = self.project.path_of(included)
+            if path is None or path.stat().st_mtime != mtime:
+                return True
+        return False
+
+    def rendered(self, path: Path, source: str, *, given: bool) -> str:
+        """Return the whole template as the database gets it, headed by how.
+
+        With ``given``, every parameter it reads has a value, so every optional
+        part is there. Without, none has one. The SQL is the project's dialect,
+        and a macro of the project's own Python stays a call.
+        """
+        name = self.project.name_of(path) or path.name
+        dialect = self.project.dialect or "postgresql"
+        try:
+            template = self.compiled(name, source)
+            names = sorted(template.parameters())
+            values = dict.fromkeys(names, "x" if given else None)
+            with written_as_called(template.namespace):
+                sql = template.render(Context(dialect, _preparer(dialect), values))
+        except Exception as error:  # noqa: BLE001 - shown in place of the SQL
+            return f"-- {name} cannot be written without real values: {error}\n"
+        listed = ", ".join(f":{one}" for one in names) or "no parameters"
+        state = "given" if given else "not given"
+        return f"-- {name} on {dialect}, {listed} {state}\n{sql.strip()}\n"
 
     def holds_macros(self, path: Path) -> bool:
         """Whether a file defines macros: SQL macros, or the SQL of a file macro."""
@@ -351,7 +427,7 @@ class _Assistant:
             return self._parameters(source)
         return []
 
-    def hover(self, source: str, offset: int) -> str | None:
+    def hover(self, source: str, offset: int, path: Path | None = None) -> str | None:
         """Return how the macro under the offset is called, and its docstring."""
         name = self._macro_at(source, offset)
         if name == INCLUDE:
@@ -364,12 +440,15 @@ class _Assistant:
         if macro is None:
             return None
         signature = signature_of(macro, self.project.templates.namespace)
-        written = self.written(source, offset)
+        template = (
+            "<hover>" if path is None else self.project.name_of(path) or path.name
+        )
+        written = self.written(source, offset, template)
         if not written:
             return f"```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
         return f"{written}\n\n```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
 
-    def written(self, source: str, offset: int) -> str:
+    def written(self, source: str, offset: int, name: str = "<hover>") -> str:
         """Return the SQL the call under the offset writes, as Markdown.
 
         It is written on the project's dialect: once with every parameter it
@@ -377,15 +456,18 @@ class _Assistant:
         cannot be written without real values.
         """
         try:
-            template = self.project.load("<hover>", source)
+            template = self.compiled(name, source)
         except SQLAKitError:
             return ""
         call = _innermost(template.parts, offset)
-        if call is None:
+        # A macro of the project's own Python would write only its call again.
+        if call is None or isinstance(
+            self.project.templates.macros.get(call.name), StaticMacro
+        ):
             return ""
         text = source[call.span[0] : call.span[1]]
         try:
-            alone = self.project.load("<hover>", text)
+            alone = self.compiled(name, text)
         except SQLAKitError:
             return ""
         names = sorted(alone.parameters())
@@ -575,7 +657,7 @@ class _Assistant:
         if cached is not None and cached[0] == stamp:
             return cached[1]
         try:
-            reads = self.project.load(name, _read(path)).parameters()
+            reads = self.compiled(name, _read(path)).parameters()
         except SQLAKitError:
             return None
         self._reads[name] = (stamp, reads)
@@ -1365,7 +1447,9 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         text = (
             None
             if found is None or found.python
-            else found.helper.hover(found.source, found.offset)
+            else found.helper.hover(
+                found.source, found.offset, _path(params.text_document.uri)
+            )
         )
         if text is None:
             return None
@@ -1522,6 +1606,44 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                 types.RenameFile(old.resolve().as_uri(), new.resolve().as_uri())
             )
         return types.WorkspaceEdit(document_changes=changes)
+
+    @server.feature(types.TEXT_DOCUMENT_CODE_ACTION)
+    def code_actions(_ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        """Offer the whole template, rendered, in a template."""
+        helper = assistant()
+        path = _path(params.text_document.uri)
+        if helper is None or helper.project.name_of(path) is None:
+            return None
+        if helper.holds_macros(path) or not path.name.endswith(".sql"):
+            return None
+        return [
+            types.CodeAction(
+                title=f"Show rendered SQL, {caption}",
+                kind=types.CodeActionKind.Empty,
+                command=types.Command(
+                    title=f"Show rendered SQL, {caption}",
+                    command=RENDER,
+                    arguments=[params.text_document.uri, given],
+                ),
+            )
+            for caption, given in (("parameters given", True), ("no parameters", False))
+        ]
+
+    @server.command(RENDER)
+    async def render(ls: LanguageServer, uri: str, given: bool) -> None:  # noqa: FBT001
+        """Write the rendered template to a file, and have the editor open it."""
+        helper = assistant()
+        if helper is None:
+            return
+        path = _path(uri)
+        source = ls.workspace.get_text_document(uri).source
+        name = helper.project.name_of(path) or path.name
+        written = _RENDERED / ("given" if given else "none") / name
+        written.parent.mkdir(parents=True, exist_ok=True)
+        written.write_text(helper.rendered(path, source, given=given), encoding="utf-8")
+        await ls.window_show_document_async(
+            types.ShowDocumentParams(written.as_uri(), take_focus=True)
+        )
 
     @server.feature(types.TEXT_DOCUMENT_DOCUMENT_LINK)
     def document_link(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
