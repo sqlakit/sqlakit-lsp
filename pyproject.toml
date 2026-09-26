@@ -1,6 +1,6 @@
 [project]
 name = "sqlakit-lsp"
-version = "0.1.0"
+version = "0.1.1"
 description = "The language server for SQLAKit templates."
 readme = "README.md"
 license = "MIT"
@@ -24,7 +24,7 @@ requires-python = ">=3.11"
 dependencies = [
     # The server reads the private modules of `sqlakit`, which a minor version
     # may change.
-    "sqlakit>=0.21.0,<0.22",
+    "sqlakit>=0.21.0,<0.23",
     "pygls>=2.1,<3",
 ]
 

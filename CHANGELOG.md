@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Runs with `sqlakit` 0.22 as well as 0.21.
+
 ## 0.1.0
 
 The first release: a language server for SQLAKit templates, run as
