@@ -1085,20 +1085,22 @@ def test_a_template_is_read_again_when_what_it_includes_changes(
     )
 
 
-def test_a_whole_template_renders_with_its_parameters_given_or_not(
+def test_a_whole_template_renders_with_every_part_and_its_placeholders(
     assistant: _Assistant, project: Path
 ) -> None:
-    good = project / "sql" / "good.sql"
-    source = good.read_text()
+    (project / "sql" / "rows.sql").write_text(
+        "SELECT * FROM tpl.values(:rows) AS v WHERE tpl.if_set(:q, name = :q)\n"
+        "  AND tpl.mine(:teams)"
+    )
+    rows = project / "sql" / "rows.sql"
 
-    given = assistant.rendered(good, source, given=True)
-    none = assistant.rendered(good, source, given=False)
+    rendered = assistant.rendered(rows, rows.read_text())
 
-    assert given.splitlines()[0] == "-- good.sql on postgresql, :q, :teams given"
-    assert "tpl.mine(:teams)" in given
-    assert "name = :q" in given
-    assert none.splitlines()[0] == "-- good.sql on postgresql, :q, :teams not given"
-    assert "name = :q" not in none
+    assert rendered == (
+        "-- rows.sql on postgresql\n"
+        "SELECT * FROM (VALUES (:rows__1)) AS v WHERE name = :q\n"
+        "  AND tpl.mine(:teams)\n"
+    )
 
 
 @pytest.mark.anyio
@@ -1141,19 +1143,16 @@ async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
             types.CodeActionContext(diagnostics=[]),
         )
     )
-    assert [action.title for action in actions or []] == [
-        "Show rendered SQL, parameters given",
-        "Show rendered SQL, no parameters",
-    ]
+    assert [action.title for action in actions or []] == ["Show rendered SQL"]
     await client.workspace_execute_command_async(
-        types.ExecuteCommandParams(RENDER, [uri, True])
+        types.ExecuteCommandParams(RENDER, [uri])
     )
 
     [opened] = shown
     written = Path(unquote(urlparse(opened).path))
     assert written.name == "good.sql"
     text = await asyncio.to_thread(written.read_text)
-    assert text.startswith("-- good.sql on postgresql, :q, :teams given")
+    assert text.startswith("-- good.sql on postgresql\n")
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()
@@ -1168,7 +1167,7 @@ async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
 
     client = LanguageClient("test", "1")
     await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
-    await client.initialize_async(
+    started = await client.initialize_async(
         types.InitializeParams(
             capabilities=types.ClientCapabilities(
                 text_document=types.TextDocumentClientCapabilities(
@@ -1183,6 +1182,9 @@ async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
         )
     )
     client.initialized(types.InitializedParams())
+    offered = started.capabilities.code_action_provider
+    assert isinstance(offered, types.CodeActionOptions)
+    assert offered.resolve_provider
     good = project / "sql" / "good.sql"
     uri = good.as_uri()
     client.text_document_did_open(
@@ -1199,25 +1201,19 @@ async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
             types.CodeActionContext(diagnostics=[]),
         )
     )
-    chosen = types.CodeAction(
-        title="Show rendered SQL, no parameters",
-        data={"uri": uri, "given": False},
-    )
+    chosen = types.CodeAction(title="Show rendered SQL", data={"uri": uri})
     resolved = await client.code_action_resolve_async(chosen)
 
-    assert [action.title for action in actions or []] == [
-        "Show rendered SQL, parameters given",
-        "Show rendered SQL, no parameters",
-    ]
+    assert [action.title for action in actions or []] == ["Show rendered SQL"]
     assert resolved.edit is not None
     made, filled = resolved.edit.document_changes or []
     assert isinstance(made, types.CreateFile)
     assert isinstance(filled, types.TextDocumentEdit)
     assert made.uri == filled.text_document.uri
-    assert made.uri.endswith("/none/good.sql")
+    assert made.uri.endswith("/good.sql")
     [text] = filled.edits
     assert isinstance(text, types.TextEdit)
-    assert text.new_text.startswith("-- good.sql on postgresql, :q, :teams not given")
+    assert text.new_text.startswith("-- good.sql on postgresql\n")
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()

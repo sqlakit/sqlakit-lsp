@@ -46,10 +46,11 @@ from sqlakit._sql import (
     MacroTemplate,
     Param,
     SqlMacro,
+    calls_kept,
     signature_of,
     sql_macros,
 )
-from sqlakit._static import SKIPPED, StaticMacro, written_as_called
+from sqlakit._static import SKIPPED, StaticMacro
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -117,10 +118,11 @@ def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
 def _rendered(template: Any, dialect: str, values: dict[str, Any]) -> str | None:  # noqa: ANN401
     """Return the SQL a read template writes for these values, if it can.
 
-    A macro of the project's own Python is read, not run, so it stays a call.
+    A call that cannot be made with them, such as one of a macro of the
+    project's own Python, which is read and not run, stays a call.
     """
     try:
-        with written_as_called(template.namespace):
+        with calls_kept():
             return template.render(Context(dialect, _preparer(dialect), values)).strip()
     except Exception:  # noqa: BLE001 - a macro may want a value of its own kind
         return None
@@ -210,6 +212,9 @@ _PYTHON_CALL = re.compile(r"(?<![\w.])tpl\.(\w+)")
 """A macro called from Python, through the `tpl` object: `tpl.icontains(...)`."""
 
 _WORD = re.compile(r"\w+")
+
+SHOW = "Show rendered SQL"
+"""The title of the action that shows a whole template as SQL."""
 
 RENDER = "sqlakit.render"
 """The command that writes a whole template as SQL, for an editor to open."""
@@ -375,26 +380,21 @@ class _Assistant:
                 return True
         return False
 
-    def rendered(self, path: Path, source: str, *, given: bool) -> str:
-        """Return the whole template as the database gets it, headed by how.
+    def rendered(self, path: Path, source: str) -> str:
+        """Return the whole template as the database gets it, on the project's dialect.
 
-        With ``given``, every parameter it reads has a value, so every optional
-        part is there. Without, none has one. The SQL is the project's dialect,
-        and a macro of the project's own Python stays a call.
+        Every parameter counts as given, so every optional part is there, and
+        stays a placeholder. A call that cannot be made so stays a call.
         """
         name = self.project.name_of(path) or path.name
         dialect = self.project.dialect or "postgresql"
         try:
             template = self.compiled(name, source)
-            names = sorted(template.parameters())
-            values = dict.fromkeys(names, "x" if given else None)
-            with written_as_called(template.namespace):
-                sql = template.render(Context(dialect, _preparer(dialect), values))
-        except Exception as error:  # noqa: BLE001 - shown in place of the SQL
-            return f"-- {name} cannot be written without real values: {error}\n"
-        listed = ", ".join(f":{one}" for one in names) or "no parameters"
-        state = "given" if given else "not given"
-        return f"-- {name} on {dialect}, {listed} {state}\n{sql.strip()}\n"
+        except SQLAKitError as error:
+            return f"-- {name} cannot be read: {error}\n"
+        values = dict.fromkeys(template.parameters(), "x")
+        sql = _rendered(template, dialect, values) or ""
+        return f"-- {name} on {dialect}\n{sql}\n"
 
     def holds_macros(self, path: Path) -> bool:
         """Whether a file defines macros: SQL macros, or the SQL of a file macro."""
@@ -475,6 +475,10 @@ class _Assistant:
         dialect = self.project.dialect or "postgresql"
         given = _rendered(alone, dialect, dict.fromkeys(names, "x"))
         missing = _rendered(alone, dialect, dict.fromkeys(names))
+        # A call that cannot be made writes itself, which says nothing new.
+        given, missing = (
+            None if one == text.strip() else one for one in (given, missing)
+        )
         if not names or given == missing:
             one = given or missing
             return f"On {dialect}:\n\n```sql\n{one}\n```" if one else ""
@@ -1621,23 +1625,21 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         support = None if action is None else action.resolve_support
         return bool(support is not None and "edit" in support.properties)
 
-    def rendered_file(ls: LanguageServer, uri: str, given: bool) -> tuple[Path, str]:  # noqa: FBT001
+    def rendered_file(ls: LanguageServer, uri: str) -> tuple[Path, str]:
         """Return a new file for the rendered template, and what goes in it."""
         helper = assistant()
         path = _path(uri)
         source = ls.workspace.get_text_document(uri).source
         name = helper.project.name_of(path) or path.name if helper else path.name
-        text = helper.rendered(path, source, given=given) if helper else ""
+        text = helper.rendered(path, source) if helper else ""
         # A new file each time: the editor may still hold the one before.
-        written = (
-            _RENDERED / uuid.uuid4().hex[:8] / ("given" if given else "none") / name
-        )
+        written = _RENDERED / uuid.uuid4().hex[:8] / name
         written.parent.mkdir(parents=True, exist_ok=True)
         return written, text
 
-    def rendered_edit(ls: LanguageServer, uri: str, given: bool) -> types.WorkspaceEdit:  # noqa: FBT001
+    def rendered_edit(ls: LanguageServer, uri: str) -> types.WorkspaceEdit:
         """Return an edit that makes the file of the rendered template."""
-        written, text = rendered_file(ls, uri, given)
+        written, text = rendered_file(ls, uri)
         target = written.as_uri()
         start = types.Position(0, 0)
         return types.WorkspaceEdit(
@@ -1650,7 +1652,10 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             ]
         )
 
-    @server.feature(types.TEXT_DOCUMENT_CODE_ACTION)
+    # An editor asks for an action's edit only from a server that says it gives one.
+    @server.feature(
+        types.TEXT_DOCUMENT_CODE_ACTION, types.CodeActionOptions(resolve_provider=True)
+    )
     def code_actions(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
         """Offer the whole template, rendered, in a template.
 
@@ -1665,33 +1670,27 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         if helper.holds_macros(path) or not path.name.endswith(".sql"):
             return None
         uri = params.text_document.uri
-        actions = []
-        for caption, given in (("parameters given", True), ("no parameters", False)):
-            title = f"Show rendered SQL, {caption}"
-            action = types.CodeAction(title=title, kind=types.CodeActionKind.Empty)
-            if shows_documents(ls):
-                action.command = types.Command(
-                    title=title, command=RENDER, arguments=[uri, given]
-                )
-            elif resolves_edits(ls):
-                action.data = {"uri": uri, "given": given}
-            else:
-                action.edit = rendered_edit(ls, uri, given)
-            actions.append(action)
-        return actions
+        action = types.CodeAction(title=SHOW, kind=types.CodeActionKind.Empty)
+        if shows_documents(ls):
+            action.command = types.Command(title=SHOW, command=RENDER, arguments=[uri])
+        elif resolves_edits(ls):
+            action.data = {"uri": uri}
+        else:
+            action.edit = rendered_edit(ls, uri)
+        return [action]
 
     @server.feature(types.CODE_ACTION_RESOLVE)
     def resolve_action(ls: LanguageServer, action: types.CodeAction) -> Any:  # noqa: ANN401
         """Work out the edit of an action once the editor has chosen it."""
         data = action.data or {}
         if "uri" in data:
-            action.edit = rendered_edit(ls, data["uri"], bool(data["given"]))
+            action.edit = rendered_edit(ls, data["uri"])
         return action
 
     @server.command(RENDER)
-    async def render(ls: LanguageServer, uri: str, given: bool) -> None:  # noqa: FBT001
+    async def render(ls: LanguageServer, uri: str) -> None:
         """Write the rendered template to a file, and have the editor open it."""
-        written, text = rendered_file(ls, uri, given)
+        written, text = rendered_file(ls, uri)
         written.write_text(text, encoding="utf-8")
         await ls.window_show_document_async(
             types.ShowDocumentParams(written.as_uri(), take_focus=True)
