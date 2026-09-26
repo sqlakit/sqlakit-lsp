@@ -37,8 +37,11 @@ vim.lsp.enable("sqlakit")
 Zed colours the macros' calls and the parameters of a template from the
 server once its settings say `"semantic_tokens": "combined"`.
 
-The [documentation](https://sqlakit.readthedocs.io/en/stable/sql/#editor-support)
-covers what it reads and how to set it up.
+It reads the project the way `sqlakit check` does, from the `Templates(...)`
+the code builds, without running it. [SQL
+templates](https://sqlakit.readthedocs.io/en/stable/sql/#template-validation)
+covers what it reads, and `[tool.sqlakit.templates]` for a project whose code
+builds its paths in a way it can't follow.
 
 ## Development
 
@@ -47,5 +50,3 @@ $ uv sync
 $ uv run poe test
 $ uv run poe lint
 ```
-
-Until the next `sqlakit` release, `sqlakit` is read from `../sqlakit`.
