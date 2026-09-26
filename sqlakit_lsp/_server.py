@@ -19,6 +19,7 @@ offers what an editor asks for while a template is written:
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import re
 from dataclasses import dataclass
@@ -47,7 +48,7 @@ from sqlakit._sql import (
 from sqlakit._static import SKIPPED, StaticMacro
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 from sqlakit.exceptions import (
     MacroArgumentError,
     MacroSyntaxError,
@@ -238,6 +239,22 @@ class _Assistant:
         self._scans: dict[Path, _Scan] = {}
         self._reads: dict[str, tuple[int, frozenset[str]]] = {}
 
+    def keep_scans(self, previous: _Assistant) -> None:
+        """Take the files another assistant of the project has read.
+
+        What a file calls and names does not change with the macros, so the scans
+        outlive a reload, while the namespace a template calls them in stays.
+        """
+        if previous.project.templates.namespace == self.project.templates.namespace:
+            self._scans = previous._scans
+
+    def scan_all(self) -> Iterator[Path]:
+        """Read each file of the project that references look in, one at a time."""
+        sql_files, python_files = self._project_files()
+        for path in [*sql_files, *python_files]:
+            self._scan(path, None)
+            yield path
+
     def forget_files(self) -> None:
         """Read the list of templates and Python files again on the next request."""
         self._names = self._files = None
@@ -318,13 +335,14 @@ class _Assistant:
         written = self.written(source, offset)
         if not written:
             return f"```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
-        return f"```sql\n{written}\n```\n\n```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
+        return f"{written}\n\n```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
 
     def written(self, source: str, offset: int) -> str:
-        """Return the SQL the call under the offset writes, on the project's dialect.
+        """Return the SQL the call under the offset writes, as Markdown.
 
-        Once with every parameter it reads given, and once with none, when the
-        two differ. Empty when the call cannot be written without real values.
+        It is written on the project's dialect: once with every parameter it
+        reads given, and once with none, when the two differ. Empty when the call
+        cannot be written without real values.
         """
         try:
             template = self.project.load("<hover>", source)
@@ -344,10 +362,11 @@ class _Assistant:
         missing = _rendered(alone, dialect, dict.fromkeys(names))
         if not names or given == missing:
             one = given or missing
-            return f"-- on {dialect}\n{one}" if one else ""
-        listed = ", ".join(f":{name}" for name in names)
-        return "\n".join(
-            f"-- {listed} {caption}\n{sql}"
+            return f"On {dialect}:\n\n```sql\n{one}\n```" if one else ""
+        listed = ", ".join(f"`:{name}`" for name in names)
+        # A block of SQL alone, each, so an editor highlights it as SQL.
+        return "\n\n".join(
+            f"{listed} {caption}:\n\n```sql\n{sql}\n```"
             for caption, sql in (("given", given), ("not given", missing))
             if sql
         )
@@ -905,6 +924,10 @@ class _Assistant:
 _TEMPLATE_CALLS = {"sql", "from_file", "from_sql"}
 """The calls whose first argument names a template: `db.sql(...)` and its kin."""
 
+_TEMPLATE_CALL_NAMED = re.compile(rf"\b(?:{'|'.join(_TEMPLATE_CALLS)})\b")
+"""The name of a call that reads a template, anywhere in the text: a file without
+one is not parsed."""
+
 _TEMPLATE_TYPED = re.compile(r"\.(?:sql|from_file|from_sql)\(\s*[\"']([^\"']*)$")
 
 _ARGUMENT_TYPED = re.compile(
@@ -930,6 +953,8 @@ class _TemplateCall:
 
 def _template_calls(source: str) -> list[_TemplateCall]:
     """Return each call of `.sql(...)`, `.from_file(...)` or `.from_sql(...)`."""
+    if not _TEMPLATE_CALL_NAMED.search(source):
+        return []
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -972,6 +997,8 @@ def _template_names(source: str) -> list[tuple[int, int, str]]:
     A name is the first argument of `.sql(...)`, `.sql.from_file(...)` or
     `.from_sql(...)`, written as a string that ends in `.sql`.
     """
+    if not _TEMPLATE_CALL_NAMED.search(source):
+        return []
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -1122,13 +1149,16 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                 types.ShowMessageParams(types.MessageType.Warning, str(error))
             )
             return
-        state["assistant"] = _Assistant(project)
+        helper = _Assistant(project)
+        if (previous := assistant()) is not None:
+            helper.keep_scans(previous)
+        state["assistant"] = helper
         ls.window_log_message(
             types.LogMessageParams(types.MessageType.Info, "\n".join(project.found))
         )
 
     @server.feature(types.INITIALIZED)
-    def initialized(ls: LanguageServer, _: Any) -> None:  # noqa: ANN401
+    async def initialized(ls: LanguageServer, _: Any) -> None:  # noqa: ANN401
         load(ls)
         # Files made or removed outside the editor change which templates there
         # are, so the server asks to hear of them, where the editor can say.
@@ -1148,6 +1178,14 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                 ]
             )
         )
+        # The first references read every file: read them now, a file at a time,
+        # and answer what the editor asks between them.
+        helper = assistant()
+        if helper is not None:
+            for _ in helper.scan_all():
+                await asyncio.sleep(0)
+                if assistant() is not helper:
+                    break
 
     def publish(ls: LanguageServer, uri: str) -> None:
         document = ls.workspace.get_text_document(uri)

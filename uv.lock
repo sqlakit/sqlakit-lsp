@@ -421,7 +421,7 @@ dev = [
     { name = "sqlparse", specifier = ">=0.6.0" },
     { name = "sqruff", specifier = ">=0.40.0" },
     { name = "trio", specifier = ">=0.34.0" },
-    { name = "ty", specifier = ">=0.0.80" },
+    { name = "ty", specifier = ">=0.0.84" },
 ]
 docs = [
     { name = "mkdocs", specifier = ">=1.6.1,<2" },

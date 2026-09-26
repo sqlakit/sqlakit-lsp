@@ -452,7 +452,7 @@ def test_sql_macros_complete_and_hover_like_the_others(assistant: _Assistant) ->
         )
     ]
     assert assistant.hover("WHERE tpl.for_team(u)", 12) == (
-        "```sql\n-- on postgresql\n(u.team = :team)\n```\n\n"
+        "On postgresql:\n\n```sql\n(u.team = :team)\n```\n\n"
         "```sql\ntpl.for_team(t)\n```\n\nRows of the team the call asks for."
     )
 
@@ -708,6 +708,44 @@ def test_references_read_a_file_again_only_when_it_changes(
     ]
 
 
+def test_a_reloaded_project_keeps_the_files_it_read(
+    assistant: _Assistant, project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlakit_lsp._server as server
+
+    scanned = list(assistant.scan_all())
+    read: list[Path] = []
+    original = server._read
+    monkeypatch.setattr(
+        server, "_read", lambda path: read.append(path) or original(path)
+    )
+    reloaded = _Assistant(load_project(project))
+    reloaded.keep_scans(assistant)
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+
+    found = reloaded.references(good, source, source.index("mine"))
+
+    assert good.resolve() in scanned
+    assert read == []
+    assert places(project, found) == [("sql/good.sql", "mine")]
+
+
+def test_a_template_is_named_however_the_call_is_spelled(
+    assistant: _Assistant, project: Path
+) -> None:
+    code = 'rows = db . sql (\n    "inner.sql"\n).all()\nq = Q.from_sql("outer.sql")\n'
+    handlers = project / "handlers.py"
+
+    found = assistant.links(handlers, code)
+
+    assert sorted(code[start:end] for start, end, _ in found) == [
+        "inner.sql",
+        "outer.sql",
+    ]
+    assert assistant.links(handlers, 'db.execute("inner.sql")') == []
+
+
 def test_a_definition_starts_from_the_name_under_the_cursor(
     assistant: _Assistant,
 ) -> None:
@@ -833,12 +871,8 @@ def test_hover_shows_the_sql_a_call_writes(assistant: _Assistant) -> None:
     shown = assistant.hover(source, source.index("if_set"))
 
     assert shown == (
-        "```sql\n"
-        "-- :q given\n"
-        "name = :q\n"
-        "-- :q not given\n"
-        "TRUE\n"
-        "```\n\n"
+        "`:q` given:\n\n```sql\nname = :q\n```\n\n"
+        "`:q` not given:\n\n```sql\nTRUE\n```\n\n"
         "```sql\ntpl.if_set(:value, expr[, otherwise])\n```\n\n"
         + assistant.project.templates.macros["if_set"].doc
     )
