@@ -1449,3 +1449,58 @@ def test_a_context_written_out_names_its_values_as_keywords_do(
     ]
     assert assistant.passed("good.sql") == {"teams", "qq", "q"}
     assert assistant.diagnose(good, good.read_text()) == []
+
+
+def test_the_calls_of_known_macros_and_the_parameters_are_coloured(
+    assistant: _Assistant,
+) -> None:
+    source = (
+        "SELECT ':not' -- tpl.if_set(:no)\n"
+        "WHERE tpl.mine(:teams) AND tpl.if_set(:q, TRUE) AND tpl.typo(1) AND a::int"
+    )
+
+    marked = [
+        (source[start:end], kind, built_in)
+        for start, end, kind, built_in in assistant.tokens(source)
+    ]
+
+    assert marked == [
+        ("tpl", "namespace", False),
+        ("mine", "function", False),
+        (":teams", "parameter", False),
+        ("tpl", "namespace", True),
+        ("if_set", "function", True),
+        (":q", "parameter", False),
+    ]
+
+
+def test_a_parameter_read_off_an_object_works_like_any_other(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(
+        'from db import db\n\nrows = db.sql("paths.sql", criteria=c).all()\n'
+    )
+    source = (
+        "SELECT * FROM users WHERE tpl.if_set(:criteria.teams, team IN "
+        "(:criteria.teams))\n  AND status = :criteria.status.value"
+    )
+    paths = project / "sql" / "paths.sql"
+    paths.write_text(source)
+    assistant.forget_files()
+
+    marked = [
+        source[start:end]
+        for start, end, kind, _ in assistant.tokens(source)
+        if kind == "parameter"
+    ]
+
+    assert marked == [":criteria.teams", ":criteria.teams", ":criteria.status.value"]
+    assert assistant.diagnose(paths, source) == []
+    assert (
+        assistant.parameter_hover(paths, source, source.index("teams")) or ""
+    ).startswith("`:criteria` of `paths.sql`\n\nPassed by 1:")
+    assert assistant.rendered(paths, source) == (
+        "-- paths.sql on postgresql\n"
+        "SELECT * FROM users WHERE team IN (:criteria__teams)\n"
+        "  AND status = :criteria__status__value\n"
+    )

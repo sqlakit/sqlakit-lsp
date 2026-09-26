@@ -41,6 +41,7 @@ from pygls.exceptions import JsonRpcException
 from pygls.lsp.server import LanguageServer
 from sqlakit._project import Project, load_project
 from sqlakit._sql import (
+    _LITERAL,
     INCLUDE,
     NAMESPACE,
     Context,
@@ -66,7 +67,34 @@ from sqlakit.exceptions import (
 
 __all__ = ["Completion", "Diagnostic", "Target", "serve"]
 
-_PARAMETERS = re.compile(r"(?<![:\w\\]):([A-Za-z_]\w*)")
+_PARAMETERS = re.compile(r"(?<![:\w\\]):([A-Za-z_]\w*)(?:\.\w+)*")
+"""A `:parameter`, with the path read off it, `:criteria.teams`: the group is its
+name, and the match all of it."""
+
+
+class _Example:
+    """A value to render a template with: any path reads another of it.
+
+    `:criteria.teams` and `:filters["kind"]` both read one, so a template
+    renders whatever shape its values have. It writes `x`, and holds one value.
+    """
+
+    def __getattr__(self, _: str) -> _Example:
+        return self
+
+    def __getitem__(self, _: object) -> _Example:
+        return self
+
+    def __iter__(self) -> Iterator[_Example]:
+        return iter((self,))
+
+    def __len__(self) -> int:
+        return 1
+
+    def __str__(self) -> str:
+        return "x"
+
+
 _PARAMETER_TYPED = re.compile(r"(?<![:\w\\]):\w*$")
 
 
@@ -283,6 +311,9 @@ nothing to keep."""
 _LISTED = 10
 """The most calls a hover lists by name, the rest counted."""
 
+_TOKEN_TYPES = {"namespace": 0, "function": 1, "parameter": 2}
+"""What an editor colours, by the index the legend of the server gives it."""
+
 _SYMBOLS = 200
 """The most names a search of the project answers with: the editor narrows."""
 
@@ -314,6 +345,13 @@ class _Assistant:
         self._include_path = re.compile(
             rf"(?<![\w.]){namespace}\.{INCLUDE}\(\s*'([^']*)'", re.IGNORECASE
         )
+        self._marked = re.compile(
+            rf"{_LITERAL}"
+            rf"|(?<![\w.])(?P<namespace>{namespace})\.(?P<macro>[A-Za-z_]\w*)(?=\s*\()"
+            r"|(?<![:\w\\]):(?P<param>[A-Za-z_]\w*(?:\.\w+)*)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        """A macro's call or a parameter, past the strings and comments."""
         self._macro_sql = {
             Path(sql).resolve()
             for macro in project.templates.macros.values()
@@ -525,6 +563,26 @@ class _Assistant:
                 return True
         return False
 
+    def tokens(self, source: str) -> list[tuple[int, int, str, bool]]:
+        """Return the spans an editor colours, with their kind, and if built in.
+
+        They are the namespace and the name of a known macro's call, and each
+        parameter. A macro no one registered is left alone, so a typo stands out.
+        """
+        macros = self.project.templates.macros
+        found = []
+        for match in self._marked.finditer(source):
+            if match.group("param"):
+                found.append((*match.span(), "parameter", False))
+                continue
+            name = (match.group("macro") or "").lower()
+            if name != INCLUDE and name not in macros:
+                continue
+            own = isinstance(macros.get(name), StaticMacro | SqlMacro)
+            found.append((*match.span("namespace"), "namespace", not own))
+            found.append((*match.span("macro"), "function", not own))
+        return found
+
     def symbols(self, path: Path, source: str) -> list[Symbol]:
         """Return what a file holds, for an editor's outline of it.
 
@@ -650,8 +708,10 @@ class _Assistant:
             template = self.compiled(name, source)
         except SQLAKitError as error:
             return f"-- {name} cannot be read: {error}\n"
-        values = dict.fromkeys(template.parameters(), "x")
-        sql = _rendered(template, dialect, values) or ""
+        values = dict.fromkeys(template.parameters(), _Example())
+        sql = _rendered(template, dialect, values)
+        if sql is None:
+            return f"-- {name} cannot be written with made-up values.\n"
         return f"-- {name} on {dialect}\n{sql}\n"
 
     def holds_macros(self, path: Path) -> bool:
@@ -731,7 +791,7 @@ class _Assistant:
             return ""
         names = sorted(alone.parameters())
         dialect = self.project.dialect or "postgresql"
-        given = _rendered(alone, dialect, dict.fromkeys(names, "x"))
+        given = _rendered(alone, dialect, dict.fromkeys(names, _Example()))
         missing = _rendered(alone, dialect, dict.fromkeys(names))
         # A call that cannot be made writes itself, which says nothing new.
         given, missing = (
@@ -2143,6 +2203,36 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                 )
             )
         return found
+
+    @server.feature(
+        types.TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL,
+        types.SemanticTokensLegend(
+            token_types=list(_TOKEN_TYPES), token_modifiers=["defaultLibrary"]
+        ),
+    )
+    def semantic_tokens(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        """Colour the macros' calls and the parameters of a template."""
+        helper = assistant()
+        path = _path(params.text_document.uri)
+        if helper is None or not helper.applies_to(path):
+            return None
+        source = ls.workspace.get_text_document(params.text_document.uri).source
+        data: list[int] = []
+        line = column = 0
+        for start, end, kind, built_in in helper.tokens(source):
+            at_line, at_column = position_of(source, start)
+            length = position_of(source, end)[1] - at_column
+            data.extend(
+                (
+                    at_line - line,
+                    at_column - column if at_line == line else at_column,
+                    length,
+                    _TOKEN_TYPES[kind],
+                    int(built_in),
+                )
+            )
+            line, column = at_line, at_column
+        return types.SemanticTokens(data=data)
 
     @server.feature(types.TEXT_DOCUMENT_DOCUMENT_LINK)
     def document_link(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401

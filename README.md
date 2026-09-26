@@ -22,6 +22,9 @@ vim.lsp.config("sqlakit", {
 vim.lsp.enable("sqlakit")
 ```
 
+Zed colours the macros' calls and the parameters of a template from the
+server once its settings say `"semantic_tokens": "combined"`.
+
 The [documentation](https://sqlakit.readthedocs.io/en/stable/sql/#editor-support)
 covers what it reads and how to set it up.
 

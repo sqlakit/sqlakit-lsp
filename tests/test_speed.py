@@ -124,6 +124,7 @@ def test_the_requests_an_editor_sends_most_stay_within_budget(
         "outline": lambda: assistant.symbols(template, source),
         "outline_macros": lambda: assistant.symbols(macros, macros.read_text()),
         "search": lambda: assistant.workspace_symbols("m1"),
+        "tokens": lambda: assistant.tokens(source),
         "parameter_hover": lambda: assistant.parameter_hover(
             template, source, source.index(":a")
         ),
