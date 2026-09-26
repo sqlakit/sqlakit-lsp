@@ -23,6 +23,7 @@ import asyncio
 import inspect
 import re
 import tempfile
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1607,43 +1608,98 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             )
         return types.WorkspaceEdit(document_changes=changes)
 
+    def shows_documents(ls: LanguageServer) -> bool:
+        """Whether the editor opens a file the server asks it to."""
+        window = ls.client_capabilities.window
+        shown = None if window is None else window.show_document
+        return bool(shown is not None and shown.support)
+
+    def resolves_edits(ls: LanguageServer) -> bool:
+        """Whether the editor asks for an action's edit only once it is chosen."""
+        document = ls.client_capabilities.text_document
+        action = None if document is None else document.code_action
+        support = None if action is None else action.resolve_support
+        return bool(support is not None and "edit" in support.properties)
+
+    def rendered_file(ls: LanguageServer, uri: str, given: bool) -> tuple[Path, str]:  # noqa: FBT001
+        """Return a new file for the rendered template, and what goes in it."""
+        helper = assistant()
+        path = _path(uri)
+        source = ls.workspace.get_text_document(uri).source
+        name = helper.project.name_of(path) or path.name if helper else path.name
+        text = helper.rendered(path, source, given=given) if helper else ""
+        # A new file each time: the editor may still hold the one before.
+        written = (
+            _RENDERED / uuid.uuid4().hex[:8] / ("given" if given else "none") / name
+        )
+        written.parent.mkdir(parents=True, exist_ok=True)
+        return written, text
+
+    def rendered_edit(ls: LanguageServer, uri: str, given: bool) -> types.WorkspaceEdit:  # noqa: FBT001
+        """Return an edit that makes the file of the rendered template."""
+        written, text = rendered_file(ls, uri, given)
+        target = written.as_uri()
+        start = types.Position(0, 0)
+        return types.WorkspaceEdit(
+            document_changes=[
+                types.CreateFile(target),
+                types.TextDocumentEdit(
+                    types.OptionalVersionedTextDocumentIdentifier(target, None),
+                    [types.TextEdit(types.Range(start, start), text)],
+                ),
+            ]
+        )
+
     @server.feature(types.TEXT_DOCUMENT_CODE_ACTION)
-    def code_actions(_ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
-        """Offer the whole template, rendered, in a template."""
+    def code_actions(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        """Offer the whole template, rendered, in a template.
+
+        An editor that opens a file the server asks it to gets a command that
+        does. Any other gets an edit that makes the file, which it opens as it
+        applies the edit, worked out only once chosen where the editor allows.
+        """
         helper = assistant()
         path = _path(params.text_document.uri)
         if helper is None or helper.project.name_of(path) is None:
             return None
         if helper.holds_macros(path) or not path.name.endswith(".sql"):
             return None
-        return [
-            types.CodeAction(
-                title=f"Show rendered SQL, {caption}",
-                kind=types.CodeActionKind.Empty,
-                command=types.Command(
-                    title=f"Show rendered SQL, {caption}",
-                    command=RENDER,
-                    arguments=[params.text_document.uri, given],
-                ),
-            )
-            for caption, given in (("parameters given", True), ("no parameters", False))
-        ]
+        uri = params.text_document.uri
+        actions = []
+        for caption, given in (("parameters given", True), ("no parameters", False)):
+            title = f"Show rendered SQL, {caption}"
+            action = types.CodeAction(title=title, kind=types.CodeActionKind.Empty)
+            if shows_documents(ls):
+                action.command = types.Command(
+                    title=title, command=RENDER, arguments=[uri, given]
+                )
+            elif resolves_edits(ls):
+                action.data = {"uri": uri, "given": given}
+            else:
+                action.edit = rendered_edit(ls, uri, given)
+            actions.append(action)
+        return actions
+
+    @server.feature(types.CODE_ACTION_RESOLVE)
+    def resolve_action(ls: LanguageServer, action: types.CodeAction) -> Any:  # noqa: ANN401
+        """Work out the edit of an action once the editor has chosen it."""
+        data = action.data or {}
+        if "uri" in data:
+            action.edit = rendered_edit(ls, data["uri"], bool(data["given"]))
+        return action
 
     @server.command(RENDER)
     async def render(ls: LanguageServer, uri: str, given: bool) -> None:  # noqa: FBT001
         """Write the rendered template to a file, and have the editor open it."""
-        helper = assistant()
-        if helper is None:
-            return
-        path = _path(uri)
-        source = ls.workspace.get_text_document(uri).source
-        name = helper.project.name_of(path) or path.name
-        written = _RENDERED / ("given" if given else "none") / name
-        written.parent.mkdir(parents=True, exist_ok=True)
-        written.write_text(helper.rendered(path, source, given=given), encoding="utf-8")
+        written, text = rendered_file(ls, uri, given)
+        written.write_text(text, encoding="utf-8")
         await ls.window_show_document_async(
             types.ShowDocumentParams(written.as_uri(), take_focus=True)
         )
+
+    @server.feature(types.WORKSPACE_DID_CHANGE_CONFIGURATION)
+    def configured(_ls: LanguageServer, _params: Any) -> None:  # noqa: ANN401
+        """Take the settings an editor sends: the server has none."""
 
     @server.feature(types.TEXT_DOCUMENT_DOCUMENT_LINK)
     def document_link(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401

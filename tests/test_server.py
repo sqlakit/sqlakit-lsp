@@ -1117,7 +1117,12 @@ async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
     await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
     await client.initialize_async(
         types.InitializeParams(
-            capabilities=types.ClientCapabilities(), root_uri=project.as_uri()
+            capabilities=types.ClientCapabilities(
+                window=types.WindowClientCapabilities(
+                    show_document=types.ShowDocumentClientCapabilities(support=True)
+                )
+            ),
+            root_uri=project.as_uri(),
         )
     )
     client.initialized(types.InitializedParams())
@@ -1149,6 +1154,70 @@ async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
     assert written.name == "good.sql"
     text = await asyncio.to_thread(written.read_text)
     assert text.startswith("-- good.sql on postgresql, :q, :teams given")
+    await client.shutdown_async(None)
+    client.exit(None)
+    await client.stop()
+
+
+@pytest.mark.anyio
+async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
+    project: Path,
+) -> None:
+    from lsprotocol import types
+    from pygls.lsp.client import LanguageClient
+
+    client = LanguageClient("test", "1")
+    await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    await client.initialize_async(
+        types.InitializeParams(
+            capabilities=types.ClientCapabilities(
+                text_document=types.TextDocumentClientCapabilities(
+                    code_action=types.CodeActionClientCapabilities(
+                        resolve_support=types.ClientCodeActionResolveOptions(
+                            properties=["edit"]
+                        )
+                    )
+                )
+            ),
+            root_uri=project.as_uri(),
+        )
+    )
+    client.initialized(types.InitializedParams())
+    good = project / "sql" / "good.sql"
+    uri = good.as_uri()
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(
+            types.TextDocumentItem(uri, "sql", 1, good.read_text())
+        )
+    )
+    everything = types.Range(types.Position(0, 0), types.Position(0, 0))
+
+    actions = await client.text_document_code_action_async(
+        types.CodeActionParams(
+            types.TextDocumentIdentifier(uri),
+            everything,
+            types.CodeActionContext(diagnostics=[]),
+        )
+    )
+    chosen = types.CodeAction(
+        title="Show rendered SQL, no parameters",
+        data={"uri": uri, "given": False},
+    )
+    resolved = await client.code_action_resolve_async(chosen)
+
+    assert [action.title for action in actions or []] == [
+        "Show rendered SQL, parameters given",
+        "Show rendered SQL, no parameters",
+    ]
+    assert resolved.edit is not None
+    made, filled = resolved.edit.document_changes or []
+    assert isinstance(made, types.CreateFile)
+    assert isinstance(filled, types.TextDocumentEdit)
+    assert made.uri == filled.text_document.uri
+    assert made.uri.endswith("/none/good.sql")
+    [text] = filled.edits
+    assert isinstance(text, types.TextEdit)
+    assert text.new_text.startswith("-- good.sql on postgresql, :q, :teams not given")
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()
