@@ -234,19 +234,30 @@ class _Assistant:
             if (sql := getattr(macro, "sql_path", None)) is not None
         }
         """The files `@sql_macro("file.sql")` keeps its SQL in."""
+        self._sources: set[Path] | None = None
         self._names: list[str] | None = None
         self._files: tuple[list[Path], list[Path]] | None = None
         self._scans: dict[Path, _Scan] = {}
         self._reads: dict[str, tuple[int, frozenset[str]]] = {}
 
-    def keep_scans(self, previous: _Assistant) -> None:
-        """Take the files another assistant of the project has read.
+    def keep(self, previous: _Assistant) -> None:
+        """Take what another assistant of the project has read, where it still holds.
 
         What a file calls and names does not change with the macros, so the scans
-        outlive a reload, while the namespace a template calls them in stays.
+        outlive a reload, while the namespace a template calls them in stays. The
+        list of files stays while the templates and the files of macros do: a file
+        made or removed is `forget_files`.
         """
-        if previous.project.templates.namespace == self.project.templates.namespace:
+        before, after = previous.project, self.project
+        if before.templates.namespace == after.templates.namespace:
             self._scans = previous._scans
+        if (
+            tuple(before.templates.paths) == tuple(after.templates.paths)
+            and before.macro_files() == after.macro_files()
+            and previous._macro_sql == self._macro_sql
+        ):
+            self._names = previous._names
+            self._files = previous._files
 
     def scan_all(self) -> Iterator[Path]:
         """Read each file of the project that references look in, one at a time."""
@@ -254,6 +265,13 @@ class _Assistant:
         for path in [*sql_files, *python_files]:
             self._scan(path, None)
             yield path
+
+    def lists(self, path: Path) -> bool:
+        """Whether the list of files, if it was read, holds this one."""
+        if self._files is None:
+            return True
+        resolved = path.resolve()
+        return any(resolved in files for files in self._files)
 
     def forget_files(self) -> None:
         """Read the list of templates and Python files again on the next request."""
@@ -264,6 +282,20 @@ class _Assistant:
         if self._names is None:
             self._names = self.project.templates.names()
         return self._names
+
+    def defines_macros(self, path: Path) -> bool:
+        """Whether a file defines a macro the project calls, its own or built in.
+
+        The library's own file is one: references on `def identifier` there are
+        the calls of `tpl.identifier` in the templates.
+        """
+        if self._sources is None:
+            self._sources = {
+                target.path.resolve()
+                for macro in self.project.templates.macros.values()
+                if (target := _source_of(macro)) is not None
+            }
+        return path.resolve() in self._sources
 
     def applies_to(self, path: Path) -> bool:
         """Whether a file is a template of this project, or holds its macros."""
@@ -1151,7 +1183,7 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             return
         helper = _Assistant(project)
         if (previous := assistant()) is not None:
-            helper.keep_scans(previous)
+            helper.keep(previous)
         state["assistant"] = helper
         ls.window_log_message(
             types.LogMessageParams(types.MessageType.Info, "\n".join(project.found))
@@ -1214,25 +1246,31 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
 
     @server.feature(types.TEXT_DOCUMENT_DID_SAVE)
     def did_save(ls: LanguageServer, params: Any) -> None:  # noqa: ANN401
-        changed(ls, [_path(params.text_document.uri)])
+        path = _path(params.text_document.uri)
+        # An editor that watches no files says a new one is there by saving it.
+        helper = assistant()
+        changed(ls, [path], moved=helper is not None and not helper.lists(path))
         publish(ls, params.text_document.uri)
 
     @server.feature(types.WORKSPACE_DID_CHANGE_WATCHED_FILES)
     def watched(ls: LanguageServer, params: Any) -> None:  # noqa: ANN401
-        changed(ls, [_path(change.uri) for change in params.changes])
+        moved = any(
+            change.type != types.FileChangeType.Changed for change in params.changes
+        )
+        changed(ls, [_path(change.uri) for change in params.changes], moved=moved)
 
-    def changed(ls: LanguageServer, paths: list[Path]) -> None:
+    def changed(ls: LanguageServer, paths: list[Path], *, moved: bool) -> None:
         """Take in files that changed on disk.
 
         Python and files of macros can add or change a macro, so the project is
-        read again. Anything else changes at most which templates there are.
+        read again. A file made or removed changes which files there are.
         """
         helper = assistant()
         if helper is None:
             return
         if any(path.suffix == ".py" or helper.holds_macros(path) for path in paths):
             load(ls)
-        else:
+        if moved and (helper := assistant()) is not None:
             helper.forget_files()
 
     def at(ls: LanguageServer, params: Any) -> _At | None:  # noqa: ANN401
@@ -1240,7 +1278,9 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         path = _path(params.text_document.uri)
         if helper is None:
             return None
-        python = helper.reads_python(path)
+        python = helper.reads_python(path) or (
+            path.suffix == ".py" and helper.defines_macros(path)
+        )
         if not (python or helper.applies_to(path)):
             return None
         source = ls.workspace.get_text_document(params.text_document.uri).source

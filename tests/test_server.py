@@ -720,7 +720,7 @@ def test_a_reloaded_project_keeps_the_files_it_read(
         server, "_read", lambda path: read.append(path) or original(path)
     )
     reloaded = _Assistant(load_project(project))
-    reloaded.keep_scans(assistant)
+    reloaded.keep(assistant)
     good = project / "sql" / "good.sql"
     source = good.read_text()
 
@@ -729,6 +729,26 @@ def test_a_reloaded_project_keeps_the_files_it_read(
     assert good.resolve() in scanned
     assert read == []
     assert places(project, found) == [("sql/good.sql", "mine")]
+
+
+def test_a_reloaded_project_keeps_its_files_until_one_is_made(
+    assistant: _Assistant, project: Path
+) -> None:
+    list(assistant.scan_all())
+    reloaded = _Assistant(load_project(project))
+    reloaded.keep(assistant)
+    made = project / "sql" / "made.sql"
+    made.write_text("SELECT tpl.mine(:x)")
+    kept = reloaded.names()
+
+    listed_before = reloaded.lists(made)
+    reloaded.forget_files()
+
+    assert "made.sql" not in kept
+    assert assistant.lists(project / "sql" / "good.sql")
+    assert not listed_before
+    assert reloaded.lists(made)
+    assert "made.sql" in reloaded.names()
 
 
 def test_a_template_is_named_however_the_call_is_spelled(
@@ -998,3 +1018,22 @@ async def test_a_rename_reaches_the_editor_as_one_edit(project: Path) -> None:
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()
+
+
+def test_a_built_in_macro_is_referenced_from_its_def(
+    assistant: _Assistant, project: Path
+) -> None:
+    import sqlakit._sql
+
+    library = Path(sqlakit._sql.__file__)
+    source = library.read_text()
+    at = source.index("def if_set(") + len("def ")
+
+    found = assistant.references(library, source, at)
+
+    assert assistant.defines_macros(library)
+    assert not assistant.defines_macros(project / "sql" / "good.sql")
+    assert places(project, found) == [("sql/good.sql", "if_set")]
+    assert assistant.python_definition(source, at, library) == Target(
+        library, source.count("\n", 0, at), len("def ")
+    )
