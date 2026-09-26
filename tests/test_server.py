@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import pytest
+from lsprotocol import types
 from sqlakit._project import load_project
 from sqlakit._sql import sql_macros
 
@@ -241,7 +242,7 @@ def test_a_macro_completes_as_a_call_with_placeholders(assistant: _Assistant) ->
 def test_an_include_completes_the_macro_templates(assistant: _Assistant) -> None:
     source = "FROM tpl.include('in"
     assert assistant.complete(source, len(source)) == [
-        Completion("inner.sql", "template")
+        Completion("inner.sql", "template", replaces=2)
     ]
 
 
@@ -512,7 +513,7 @@ def test_a_template_name_in_the_code_goes_to_its_file(
 def test_a_template_name_completes_in_the_code(assistant: _Assistant) -> None:
     source = 'rows = db.sql("go'
     assert assistant.python_complete(source, len(source)) == [
-        Completion("good.sql", "template")
+        Completion("good.sql", "template", replaces=2)
     ]
     assert assistant.python_complete("print('go", 9) == []
 
@@ -869,6 +870,76 @@ def test_the_parameters_of_a_template_complete_in_its_call(
     assert [one.label for one in typed] == ["q"]
 
 
+def test_the_parameters_complete_only_inside_the_call(assistant: _Assistant) -> None:
+    code = 'db.sql("good.sql",\n    teams=1,\n)\n\nfoo = ba'
+
+    assert assistant.python_complete(code, len(code)) == []
+
+
+def test_a_form_feed_leaves_the_code_where_it_is(assistant: _Assistant) -> None:
+    # `ast` breaks lines at `\n` only, where `str.splitlines` also takes these.
+    code = 'page = 1\n\x0c\ns = "a\u2028b"\ndb.sql("good.sql", zz=1)\n'
+
+    [found] = assistant.python_diagnose(code)
+
+    assert code[found.start : found.end] == "zz"
+
+
+def test_a_half_typed_file_of_sql_macros_says_what_is_wrong(
+    assistant: _Assistant, project: Path
+) -> None:
+    source = "SELECT 'x"
+
+    [found] = assistant.diagnose(project / "_macros.sql", source)
+
+    assert found.message == "a quoted string is never closed"
+
+
+def test_an_error_in_an_included_template_goes_once_it_is_fixed(
+    assistant: _Assistant, project: Path
+) -> None:
+    outer = project / "sql" / "outer.sql"
+    source = outer.read_text()
+    [found] = assistant.diagnose(outer, source)
+    assert "tpl.nope" in found.message
+
+    inner = project / "sql" / "inner.sql"
+    inner.write_text("SELECT 1")
+    stat = inner.stat()
+    os.utime(inner, (stat.st_atime, stat.st_mtime + 1))
+
+    assert assistant.diagnose(outer, source) == []
+
+
+def test_a_rename_starts_from_the_macro_s_name(assistant: _Assistant) -> None:
+    source = "SELECT 1 WHERE tpl.mine(:t)"
+
+    span = assistant.renamable(Path("x.sql"), source, source.index("tpl") + 1)
+
+    assert span == (source.index("mine"), source.index("mine") + len("mine"))
+
+
+def test_a_virtual_environment_is_not_read(project: Path) -> None:
+    venv = project / ".venv" / "lib" / "site.py"
+    venv.parent.mkdir(parents=True)
+    venv.write_text('db.sql("good.sql", teams=1)\n')
+    cache = project / "__pycache__" / "x.py"
+    cache.parent.mkdir()
+    cache.write_text("")
+    helper = _Assistant(load_project(project))
+
+    _, python_files = helper._project_files()
+
+    assert [
+        path.relative_to(project.resolve()).as_posix() for path in python_files
+    ] == [
+        "db.py",
+        "lsp_macros.py",
+    ]
+    assert not helper.owns(venv)
+    assert helper.owns(project / "db.py")
+
+
 def test_a_macro_s_arguments_show_while_they_are_written(
     assistant: _Assistant,
 ) -> None:
@@ -987,9 +1058,15 @@ async def test_a_rename_reaches_the_editor_as_one_edit(project: Path) -> None:
 
     client = LanguageClient("test", "1")
     await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    renames = types.WorkspaceEditClientCapabilities(
+        resource_operations=[types.ResourceOperationKind.Rename]
+    )
     await client.initialize_async(
         types.InitializeParams(
-            capabilities=types.ClientCapabilities(), root_uri=project.as_uri()
+            capabilities=types.ClientCapabilities(
+                workspace=types.WorkspaceClientCapabilities(workspace_edit=renames)
+            ),
+            root_uri=project.as_uri(),
         )
     )
     client.initialized(types.InitializedParams())
@@ -1504,3 +1581,174 @@ def test_a_parameter_read_off_an_object_works_like_any_other(
         "SELECT * FROM users WHERE team IN (:criteria__teams)\n"
         "  AND status = :criteria__status__value\n"
     )
+
+
+class _Editor:
+    """A client over stdio, with every list of problems the server publishes."""
+
+    def __init__(self) -> None:
+        from lsprotocol import types
+        from pygls.lsp.client import LanguageClient
+
+        self.client = LanguageClient("test", "1")
+        self.published: asyncio.Queue[types.PublishDiagnosticsParams] = asyncio.Queue()
+        published = self.published
+
+        @self.client.feature(types.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)
+        def diagnostics(params: types.PublishDiagnosticsParams) -> None:
+            published.put_nowait(params)
+
+    async def start(
+        self, project: Path, capabilities: types.ClientCapabilities | None = None
+    ) -> types.InitializeResult:
+        from lsprotocol import types
+
+        await self.client.start_io(
+            sys.executable, "-m", "sqlakit_lsp", cwd=str(project)
+        )
+        result = await self.client.initialize_async(
+            types.InitializeParams(
+                capabilities=capabilities or types.ClientCapabilities(),
+                root_uri=project.as_uri(),
+            )
+        )
+        self.client.initialized(types.InitializedParams())
+        return result
+
+    def open(self, path: Path, text: str) -> str:
+        from lsprotocol import types
+
+        self.client.text_document_did_open(
+            types.DidOpenTextDocumentParams(
+                types.TextDocumentItem(path.as_uri(), "sql", 1, text)
+            )
+        )
+        return path.as_uri()
+
+    async def problems(self, uri: str) -> list[str]:
+        """Return the next list of problems published for the file."""
+        while True:
+            found = await asyncio.wait_for(self.published.get(), 10)
+            if found.uri == uri:
+                return [one.message for one in found.diagnostics]
+
+    async def stop(self) -> None:
+        await self.client.shutdown_async(None)
+        self.client.exit(None)
+        await self.client.stop()
+
+
+@pytest.mark.anyio
+async def test_positions_are_utf_16_whatever_the_editor_offers(project: Path) -> None:
+    from lsprotocol import types
+
+    editor = _Editor()
+    offered = types.GeneralClientCapabilities(
+        position_encodings=[types.PositionEncodingKind.Utf8]
+    )
+    result = await editor.start(project, types.ClientCapabilities(general=offered))
+    text = "SELECT 'ёёёё' WHERE tpl.nope(:x)"
+    uri = editor.open(project / "sql" / "new.sql", text)
+
+    found = await asyncio.wait_for(editor.published.get(), 10)
+
+    assert result.capabilities.position_encoding == types.PositionEncodingKind.Utf16
+    assert found.diagnostics[0].range.start.character == text.index("tpl")
+    await editor.stop()
+    assert uri
+
+
+@pytest.mark.anyio
+async def test_the_problems_of_a_file_follow_the_project(project: Path) -> None:
+    from lsprotocol import types
+
+    editor = _Editor()
+    await editor.start(project)
+    good = project / "sql" / "new.sql"
+    uri = editor.open(good, "SELECT 1 WHERE tpl.added(:x)")
+    assert (await editor.problems(uri))[0].startswith("unknown macro tpl.added")
+
+    macros = project / "lsp_macros.py"
+    macros.write_text(
+        MACROS + '\n\n@sql_macro\ndef added(x: Param) -> str:\n    return f"x = {x}"\n'
+    )
+    editor.client.workspace_did_change_watched_files(
+        types.DidChangeWatchedFilesParams(
+            [types.FileEvent(macros.as_uri(), types.FileChangeType.Changed)]
+        )
+    )
+    assert await editor.problems(uri) == []
+
+    editor.client.text_document_did_close(
+        types.DidCloseTextDocumentParams(types.TextDocumentIdentifier(uri))
+    )
+    assert await editor.problems(uri) == []
+    await editor.stop()
+
+
+@pytest.mark.anyio
+async def test_a_project_that_could_not_be_read_is_read_once_fixed(
+    project: Path,
+) -> None:
+    from lsprotocol import types
+
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(PYPROJECT + "[tool.sqlakit.templates]\npaths = ['nowhere']\n")
+    editor = _Editor()
+    await editor.start(project)
+    uri = editor.open(project / "sql" / "new.sql", "SELECT tpl.nope(1)")
+    assert await editor.problems(uri) == []
+
+    pyproject.write_text(PYPROJECT)
+    editor.client.workspace_did_change_watched_files(
+        types.DidChangeWatchedFilesParams(
+            [types.FileEvent(pyproject.as_uri(), types.FileChangeType.Changed)]
+        )
+    )
+    assert (await editor.problems(uri))[0].startswith("unknown macro tpl.nope")
+    await editor.stop()
+
+
+@pytest.mark.anyio
+async def test_an_editor_that_renames_no_file_is_told_so(project: Path) -> None:
+    from lsprotocol import types
+    from pygls.exceptions import JsonRpcException
+
+    editor = _Editor()
+    await editor.start(project)
+    outer = project / "sql" / "outer.sql"
+    text = outer.read_text()
+    editor.open(outer, text)
+    at = types.Position(*position_of(text, text.index("inner.sql")))
+
+    with pytest.raises(JsonRpcException, match="this editor renames none"):
+        await editor.client.text_document_rename_async(
+            types.RenameParams(
+                types.TextDocumentIdentifier(outer.as_uri()), at, "reads/inner.sql"
+            )
+        )
+    await editor.stop()
+
+
+@pytest.mark.anyio
+async def test_a_template_name_replaces_the_path_typed(project: Path) -> None:
+    from lsprotocol import types
+
+    editor = _Editor()
+    await editor.start(project)
+    text = "SELECT * FROM tpl.include('in"
+    uri = editor.open(project / "sql" / "new.sql", text)
+
+    completion = await editor.client.text_document_completion_async(
+        types.CompletionParams(
+            types.TextDocumentIdentifier(uri), types.Position(0, len(text))
+        )
+    )
+
+    assert isinstance(completion, types.CompletionList)
+    [item] = completion.items
+    assert item.text_edit == types.TextEdit(
+        types.Range(types.Position(0, len(text) - 2), types.Position(0, len(text))),
+        "inner.sql",
+    )
+    await editor.stop()

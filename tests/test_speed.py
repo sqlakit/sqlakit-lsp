@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from sqlakit._project import load_project
 
-from sqlakit_lsp._server import _Assistant
+from sqlakit_lsp._server import _Assistant, position_of
 
 BUDGET = 0.015
 """Seconds a request may take, as the median of several: generous for a slower
@@ -23,6 +23,8 @@ machine in CI, and still well under what an editor makes a person wait for."""
 TEMPLATES = 600
 PYTHON_FILES = 80
 MACROS = 40
+INSTALLED = 3000
+"""Python files in the virtual environment, which the server never reads."""
 
 
 @pytest.fixture(scope="module")
@@ -64,6 +66,10 @@ def large(tmp_path_factory: pytest.TempPathFactory) -> Path:
             f"WHERE tpl.if_set(:a, t.a = :a)\n  AND tpl.m{number % MACROS}(:x, t.a, t.b)\n"
             f"  AND tpl.s{number % 20}(t)\nORDER BY tpl.order_by(:sort, a, b, c)\nLIMIT :limit\n"
         )
+    installed = root / ".venv" / "lib" / "site-packages" / "package"
+    installed.mkdir(parents=True)
+    for index in range(INSTALLED):
+        (installed / f"module_{index}.py").write_text('db.sql("d0/q0.sql")\n')
     for file in range(PYTHON_FILES):
         calls = [
             f'def f{index}():\n    return db.sql("d{n // 30}/q{n % 30}.sql", a=1).all()\n\n'
@@ -118,6 +124,9 @@ def test_the_requests_an_editor_sends_most_stay_within_budget(
         "references": lambda: assistant.references(template, source, macro),
         "python_diagnose": lambda: assistant.python_diagnose(code),
         "python_complete": lambda: assistant.python_complete('db.sql("d1/', 11),
+        "include_complete": lambda: assistant.complete(
+            "FROM tpl.include('d1/", len("FROM tpl.include('d1/")
+        ),
         "fixes": lambda: assistant.fixes(
             broken, unknown.start, unknown.end, unknown.message
         ),
@@ -133,3 +142,30 @@ def test_the_requests_an_editor_sends_most_stay_within_budget(
     spent = {name: _median(call) for name, call in requests.items()}
 
     assert {name: seconds for name, seconds in spent.items() if seconds > BUDGET} == {}
+
+
+def test_a_file_made_costs_the_next_keystroke_little(
+    assistant: _Assistant, large: Path
+) -> None:
+    template = large / "app" / "sql" / "d0" / "q0.sql"
+    source = template.read_text()
+    keys = itertools.count()
+
+    def made() -> None:
+        assistant.forget_files()
+        assistant.diagnose(template, f"{source}-- {next(keys)}")
+
+    # The list of files is read again, and not the virtual environment's.
+    assert _median(made, times=5) < BUDGET * 3
+
+
+def test_a_long_template_is_coloured_within_budget(assistant: _Assistant) -> None:
+    line = "  AND tpl.if_set(:a, t.a = :a) AND tpl.m1(:x, t.b)\n"
+    source = "SELECT *\nFROM t\nWHERE TRUE\n" + line * 3000
+
+    def coloured() -> None:
+        for start, end, _, _ in assistant.tokens(source):
+            position_of(source, start)
+            position_of(source, end)
+
+    assert _median(coloured, times=5) < BUDGET * 3

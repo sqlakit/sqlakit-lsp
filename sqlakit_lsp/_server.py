@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import bisect
 import difflib
 import inspect
 import re
@@ -31,7 +32,6 @@ from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import unquote, urlparse
 
 import sqlalchemy as sa
 import sqlalchemy.engine.default
@@ -39,6 +39,9 @@ import sqlalchemy.exc
 from lsprotocol import types
 from pygls.exceptions import JsonRpcException
 from pygls.lsp.server import LanguageServer
+from pygls.protocol import LanguageServerProtocol
+from pygls.protocol.language_server import lsp_method
+from pygls.uris import to_fs_path
 from sqlakit._project import Project, load_project
 from sqlakit._sql import (
     _LITERAL,
@@ -53,10 +56,7 @@ from sqlakit._sql import (
     signature_of,
     sql_macros,
 )
-from sqlakit._static import SKIPPED, StaticMacro
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+from sqlakit._static import SKIPPED, StaticMacro, walk
 from sqlakit.exceptions import (
     MacroArgumentError,
     MacroSyntaxError,
@@ -64,6 +64,9 @@ from sqlakit.exceptions import (
     SQLAKitError,
     UnknownMacroError,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Generator, Iterator, Mapping, Sequence
 
 __all__ = ["Completion", "Diagnostic", "Target", "serve"]
 
@@ -120,6 +123,9 @@ class Completion:
     documentation: str = ""
     snippet: str | None = None
     """The text to insert, with `${1:placeholders}`, when it is not the label."""
+    replaces: int = 0
+    """How much of the text before the cursor it replaces: the part of a path
+    typed, which an editor's word would stop at a `/` in."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +364,16 @@ class _Assistant:
             if (sql := getattr(macro, "sql_path", None)) is not None
         }
         """The files `@sql_macro("file.sql")` keeps its SQL in."""
+        self._macro_files = {path.resolve() for path in project.macro_files()} | {
+            macro.path.resolve()
+            for macro in project.templates.macros.values()
+            if isinstance(macro, SqlMacro)
+        }
+        """The files of SQL macros, those that register none yet among them."""
+        self._root = project.root.resolve()
+        self._template_roots = [
+            Path(root).resolve() for root in project.templates.paths
+        ]
         self._sources: set[Path] | None = None
         self._passed: dict[str, frozenset[str] | None] = {}
         self._including: dict[str, set[str]] | None = None
@@ -365,6 +381,8 @@ class _Assistant:
         self._compiles: OrderedDict[tuple[str, str], Any] = OrderedDict()
         self._names: list[str] | None = None
         self._files: tuple[list[Path], list[Path]] | None = None
+        self._named: dict[Path, str] = {}
+        """The name of each template in the list of files."""
         self._scans: dict[Path, _Scan] = {}
         self._reads: dict[str, tuple[int, frozenset[str]]] = {}
 
@@ -386,6 +404,8 @@ class _Assistant:
         ):
             self._names = previous._names
             self._files = previous._files
+            self._named = previous._named
+            self._including = previous._including
 
     def scan_all(self) -> Iterator[Path]:
         """Read each file of the project that references look in, one at a time."""
@@ -400,6 +420,24 @@ class _Assistant:
             return True
         resolved = path.resolve()
         return any(resolved in files for files in self._files)
+
+    def owns(self, path: Path) -> bool:
+        """Whether a file is the project's own, where `walk` goes.
+
+        A virtual environment, a cache or a hidden directory is not.
+        """
+        try:
+            parts = path.resolve().relative_to(self._root).parts[:-1]
+        except ValueError:
+            return False
+        return not any(part in SKIPPED or part.startswith(".") for part in parts)
+
+    def is_template(self, path: Path) -> bool:
+        """Whether a file is under a template directory, saved or not."""
+        resolved = path.resolve()
+        return path.suffix == ".sql" and any(
+            resolved.is_relative_to(root) for root in self._template_roots
+        )
 
     def forget_files(self) -> None:
         """Read the list of templates and Python files again on the next request."""
@@ -517,10 +555,8 @@ class _Assistant:
         """Return, for each template, the templates that include it."""
         if self._including is None:
             including: dict[str, set[str]] = {}
-            for path in self._project_files()[0]:
-                reader = self.project.name_of(path)
-                if reader is None:
-                    continue
+            self._project_files()
+            for path, reader in self._named.items():
                 for included in self._scan(path, None).templates:
                     including.setdefault(included, set()).add(reader)
             self._including = including
@@ -548,13 +584,18 @@ class _Assistant:
         try:
             found = self.project.load(name, source)
         except SQLAKitError as error:
-            found = error
+            # An error in an included file goes when that file is fixed, which
+            # the text in hand does not show: only this text's own is kept.
+            if not getattr(error, "chain", ()):
+                self._keep(key, error)
+            raise
+        self._keep(key, found)
+        return found
+
+    def _keep(self, key: tuple[str, str], found: MacroTemplate | SQLAKitError) -> None:
         self._compiles[key] = found
         while len(self._compiles) > _COMPILES:
             self._compiles.popitem(last=False)
-        if isinstance(found, SQLAKitError):
-            raise found
-        return found
 
     def _includes_changed(self, template: MacroTemplate) -> bool:
         for included, mtime in template.includes.items():
@@ -719,18 +760,19 @@ class _Assistant:
         return self._reads_macros(path) or path.resolve() in self._macro_sql
 
     def _reads_macros(self, path: Path) -> bool:
-        resolved = path.resolve()
-        return any(
-            isinstance(macro, SqlMacro) and macro.path.resolve() == resolved
-            for macro in self.project.templates.macros.values()
-        )
+        return path.resolve() in self._macro_files
 
     def _diagnose_macros(self, path: Path, source: str) -> list[Diagnostic]:
         """Return what is wrong with each macro of a file of SQL macros."""
+        try:
+            problems = self.project.macro_problems(path, source)
+        except MacroSyntaxError as error:
+            # Half typed, the file cannot be split into macros at all.
+            return [self._placed(error, path.name, source)]
         return [
             *(
                 Diagnostic(*_line_span(source, line), message)
-                for line, message in self.project.macro_problems(path, source)
+                for line, message in problems
             ),
             *(Diagnostic(*found) for found in self.project.foreign_calls(source)),
         ]
@@ -1041,7 +1083,7 @@ class _Assistant:
         typed = source[source.rfind("\n", 0, offset) + 1 : offset]
         if match := _TEMPLATE_TYPED.search(typed):
             return [
-                Completion(name, "template")
+                Completion(name, "template", replaces=len(match.group(1)))
                 for name in self.names()
                 if name.startswith(match.group(1))
             ]
@@ -1128,7 +1170,8 @@ class _Assistant:
         problem = self._definitions(name)
         if isinstance(problem, str):
             return problem
-        span = _word_at(source, offset)
+        # On `tpl.mine`, the name renames, whichever half the cursor is on.
+        span = self._called_at(source, offset) or _word_at(source, offset)
         return span if span is not None else (offset, offset)
 
     def rename(
@@ -1325,34 +1368,39 @@ class _Assistant:
         The paths are resolved, as the editor's open files are keyed.
         """
         if self._files is None:
-            roots = [Path(root).resolve() for root in self.project.templates.paths]
-            templates = (
-                next((root / name for root in roots if (root / name).is_file()), None)
-                for name in self.names()
-            )
+            named = {}
+            for name in self.names():
+                for root in self._template_roots:
+                    if (root / name).is_file():
+                        named[root / name] = name
+                        break
             sql_files = [
-                *(path for path in templates if path is not None),
+                *named,
                 *(path.resolve() for path in self.project.macro_files()),
                 *sorted(self._macro_sql),
             ]
-            root = self.project.root.resolve()
             python_files = [
-                path
-                for path in sorted(root.rglob("*.py"))
-                if not any(
-                    part in SKIPPED for part in path.relative_to(root).parts[:-1]
-                )
+                directory / file
+                for directory, files in walk(self._root)
+                for file in files
+                if file.endswith(".py")
             ]
+            self._named = named
             self._files = (sql_files, python_files)
         return self._files
 
     def _macro_at(self, source: str, offset: int) -> str | None:
+        span = self._called_at(source, offset)
+        return None if span is None else source[slice(*span)].lower()
+
+    def _called_at(self, source: str, offset: int) -> tuple[int, int] | None:
+        """Return where the name of the macro called at the offset is written."""
         start = source.rfind("\n", 0, offset) + 1
         end = source.find("\n", offset)
         line = source[start : len(source) if end < 0 else end]
         for match in self._name_at.finditer(line):
             if match.start() <= offset - start <= match.end():
-                return match.group(2).lower()
+                return start + match.start(2), start + match.end(2)
         return None
 
     def _macros(self, typed: str) -> list[Completion]:
@@ -1382,8 +1430,8 @@ class _Assistant:
 
     def _templates(self, typed: str) -> list[Completion]:
         return [
-            Completion(name, "template")
-            for name in self.project.templates.names()
+            Completion(name, "template", replaces=len(typed))
+            for name in self.names()
             if name.startswith(typed)
         ]
 
@@ -1422,8 +1470,7 @@ _TEMPLATE_TYPED = re.compile(r"\.(?:sql|from_file|from_sql)\(\s*[\"']([^\"']*)$"
 
 _ARGUMENT_TYPED = re.compile(
     r"""\.(?:sql|from_file|from_sql)\(\s*["'](?P<name>[^"']+\.sql)["']\s*,"""
-    r"(?P<passed>[^()]*?)(?:^|[\s,])(?P<typed>\w*)$",
-    re.MULTILINE,
+    r"(?P<passed>[^()]*?)(?<=[\s,])(?P<typed>\w*)\Z",
 )
 """A call that names a template, and the keyword being typed after its name."""
 
@@ -1463,6 +1510,15 @@ def _named_keys(
     return found
 
 
+_LINE_BREAK = re.compile(r"\r\n?|\n")
+"""A line break as Python reads one: not a form feed, nor a Unicode separator."""
+
+
+def _line_starts(source: str) -> list[int]:
+    """Return where each line of Python starts, as `ast` numbers the lines."""
+    return [0, *(found.end() for found in _LINE_BREAK.finditer(source))]
+
+
 def _template_calls(source: str) -> list[_TemplateCall]:
     """Return each call of `.sql(...)`, `.from_file(...)` or `.from_sql(...)`."""
     if not _TEMPLATE_CALL_NAMED.search(source):
@@ -1471,9 +1527,7 @@ def _template_calls(source: str) -> list[_TemplateCall]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
-    starts = [0]
-    for line in source.splitlines(keepends=True):
-        starts.append(starts[-1] + len(line))
+    starts = _line_starts(source)
     found = []
     for node in ast.walk(tree):
         if not (
@@ -1534,9 +1588,7 @@ def _template_names(source: str) -> list[tuple[int, int, str]]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
-    starts = [0]
-    for line in source.splitlines(keepends=True):
-        starts.append(starts[-1] + len(line))
+    starts = _line_starts(source)
     found = []
     for node in ast.walk(tree):
         if not (
@@ -1652,10 +1704,37 @@ def offset_of(source: str, line: int, character: int) -> int:
 
 def position_of(source: str, offset: int) -> tuple[int, int]:
     """Return the line and the UTF-16 column of an offset, both from zero."""
-    line = source.count("\n", 0, offset)
-    start = source.rfind("\n", 0, offset) + 1
-    column = len(source[start:offset].encode("utf-16-le")) // 2
+    starts = _starts(source)
+    line = bisect.bisect_right(starts, offset) - 1
+    text = source[starts[line] : offset]
+    column = len(text) if text.isascii() else len(text.encode("utf-16-le")) // 2
     return line, column
+
+
+@lru_cache(maxsize=8)
+def _starts(source: str) -> list[int]:
+    """Return where each line starts, for the few texts a request reads.
+
+    A string keeps its hash, and a request asks of the same one each time, so
+    the lookup costs nothing next to counting the lines again.
+    """
+    return [0, *(found.end() for found in re.finditer("\n", source))]
+
+
+class _Protocol(LanguageServerProtocol):
+    """The protocol, with positions counted in UTF-16 whatever the editor offers.
+
+    Every offset here is counted the way UTF-16 counts, the one encoding each
+    editor takes, so the server announces no other.
+    """
+
+    @lsp_method(types.INITIALIZE)
+    def lsp_initialize(
+        self, params: types.InitializeParams
+    ) -> Generator[Any, Any, types.InitializeResult]:
+        if params.capabilities.general is not None:
+            params.capabilities.general.position_encodings = None
+        return (yield from super().lsp_initialize(params))
 
 
 def serve() -> None:  # pragma: no cover - run over stdio by an editor
@@ -1664,7 +1743,7 @@ def serve() -> None:  # pragma: no cover - run over stdio by an editor
 
 
 def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each request
-    server = LanguageServer("sqlakit", version("sqlakit-lsp"))
+    server = LanguageServer("sqlakit", version("sqlakit-lsp"), protocol_cls=_Protocol)
     state: dict[str, Any] = {"assistant": None, "problem": None}
 
     def assistant() -> _Assistant | None:
@@ -1703,6 +1782,7 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                             [
                                 types.FileSystemWatcher("**/*.sql"),
                                 types.FileSystemWatcher("**/*.py"),
+                                types.FileSystemWatcher("**/pyproject.toml"),
                             ]
                         ),
                     )
@@ -1743,13 +1823,20 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
     def did_change(ls: LanguageServer, params: Any) -> None:  # noqa: ANN401
         publish(ls, params.text_document.uri)
 
+    @server.feature(types.TEXT_DOCUMENT_DID_CLOSE)
+    def did_close(ls: LanguageServer, params: Any) -> None:  # noqa: ANN401
+        # What a closed file holds is no longer in the editor's list of problems.
+        ls.text_document_publish_diagnostics(
+            types.PublishDiagnosticsParams(uri=params.text_document.uri, diagnostics=[])
+        )
+
     @server.feature(types.TEXT_DOCUMENT_DID_SAVE)
     def did_save(ls: LanguageServer, params: Any) -> None:  # noqa: ANN401
         path = _path(params.text_document.uri)
         # An editor that watches no files says a new one is there by saving it.
         helper = assistant()
-        changed(ls, [path], moved=helper is not None and not helper.lists(path))
-        publish(ls, params.text_document.uri)
+        if not changed(ls, [path], moved=helper is not None and not helper.lists(path)):
+            publish(ls, params.text_document.uri)
 
     @server.feature(types.WORKSPACE_DID_CHANGE_WATCHED_FILES)
     def watched(ls: LanguageServer, params: Any) -> None:  # noqa: ANN401
@@ -1758,19 +1845,46 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         )
         changed(ls, [_path(change.uri) for change in params.changes], moved=moved)
 
-    def changed(ls: LanguageServer, paths: list[Path], *, moved: bool) -> None:
-        """Take in files that changed on disk.
+    def changed(ls: LanguageServer, paths: list[Path], *, moved: bool) -> bool:
+        """Take in files that changed on disk, and say if the open ones were checked.
 
-        Python and files of macros can add or change a macro, so the project is
-        read again. A file made or removed changes which files there are.
+        A file that configures the project, builds `Templates(...)` or defines
+        a macro, has the project read again. A template or a Python file made or
+        removed changes which files there are. A file of a virtual environment,
+        a cache or anything else is left alone. The open files are checked again
+        after either, since what they call may have changed.
         """
         helper = assistant()
         if helper is None:
-            return
-        if any(path.suffix == ".py" or helper.holds_macros(path) for path in paths):
+            # The project could not be read: a change may be what fixes it.
+            if not any(
+                path.suffix in {".sql", ".py"} or path.name == "pyproject.toml"
+                for path in paths
+            ):
+                return False
             load(ls)
-        if moved and (helper := assistant()) is not None:
-            helper.forget_files()
+        else:
+            own = [
+                path for path in paths if helper.owns(path) or helper.holds_macros(path)
+            ]
+            reload = any(
+                helper.holds_macros(path)
+                or helper.defines_macros(path)
+                or _may_configure(path)
+                for path in own
+            )
+            moved = moved and any(
+                helper.is_template(path) or path.suffix == ".py" for path in own
+            )
+            if not (reload or moved):
+                return False
+            if reload:
+                load(ls)
+            if moved and (helper := assistant()) is not None:
+                helper.forget_files()
+        for uri in list(ls.workspace.text_documents):
+            publish(ls, uri)
+        return True
 
     def at(ls: LanguageServer, params: Any) -> _At | None:  # noqa: ANN401
         helper = assistant()
@@ -1822,6 +1936,15 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                     insert_text=one.snippet,
                     insert_text_format=types.InsertTextFormat.Snippet
                     if one.snippet
+                    else None,
+                    text_edit=types.TextEdit(
+                        types.Range(
+                            types.Position(*position_of(source, offset - one.replaces)),
+                            types.Position(*position_of(source, offset)),
+                        ),
+                        one.label,
+                    )
+                    if one.replaces
                     else None,
                 )
                 for one in written
@@ -2021,11 +2144,21 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             for file, edits in by_file.items()
         ]
         if moved is not None:
+            if not renames_files(ls):
+                problem = "Renaming a template renames its file, and this editor renames none."
+                raise RequestFailed(problem)
             old, new = moved
             changes.append(
                 types.RenameFile(old.resolve().as_uri(), new.resolve().as_uri())
             )
         return types.WorkspaceEdit(document_changes=changes)
+
+    def renames_files(ls: LanguageServer) -> bool:
+        """Whether the editor renames a file as part of an edit."""
+        workspace = ls.client_capabilities.workspace
+        edit = None if workspace is None else workspace.workspace_edit
+        operations = None if edit is None else edit.resource_operations
+        return bool(operations and types.ResourceOperationKind.Rename in operations)
 
     def shows_documents(ls: LanguageServer) -> bool:
         """Whether the editor opens a file the server asks it to."""
@@ -2260,10 +2393,16 @@ def _utf16_column(target: Target) -> int:
     if not target.column:
         return 0
     try:
-        line = target.path.read_text(encoding="utf-8").splitlines()[target.line]
+        line = _lines(target.path, target.path.stat().st_mtime_ns)[target.line]
     except (OSError, IndexError):
         return target.column
     return len(line[: target.column].encode("utf-16-le")) // 2
+
+
+@lru_cache(maxsize=64)
+def _lines(path: Path, _stamp: int) -> list[str]:
+    """Return a file's lines, read once for each time it changes."""
+    return _LINE_BREAK.split(path.read_text(encoding="utf-8"))
 
 
 _SEVERITIES = {
@@ -2284,5 +2423,26 @@ def _diagnostic(source: str, found: Diagnostic) -> types.Diagnostic:
     )
 
 
+_CONFIGURES = ("sql_macro", "Templates", "Database", "templates")
+"""What a Python file that says where the templates or the macros are holds."""
+
+
+def _may_configure(path: Path) -> bool:
+    """Whether a changed file may change the project: where templates are, or a macro.
+
+    A Python file removed may have been one, and is taken as one.
+    """
+    if path.name == "pyproject.toml":
+        return True
+    if path.suffix != ".py":
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return any(word in text for word in _CONFIGURES)
+
+
 def _path(uri: str) -> Path:
-    return Path(unquote(urlparse(uri).path))
+    """Return the file of a `file:` URI, a drive and all on Windows."""
+    return Path(to_fs_path(uri) or uri)

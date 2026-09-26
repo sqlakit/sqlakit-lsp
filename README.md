@@ -1,10 +1,22 @@
 # sqlakit-lsp
 
 The language server for [SQLAKit](https://sqlakit.readthedocs.io/en/stable/)
-templates: the problems `sqlakit check` finds, as you type, completion after
-`tpl.` and of a call's parameters in Python, the arguments of a macro while you
-write them, the SQL a call writes on hover, go to definition, references, and
-rename of a macro or a template across the project.
+templates. In a `.sql` template:
+
+- the problems `sqlakit check` finds, as you type
+- completion after `tpl.` and in `tpl.include('`, and a macro's arguments while
+  you write them
+- on hover, the SQL a call writes, above the macro's signature and docstring
+- go to definition, implementation and references of a macro or a template
+- rename of a macro or a template across the project
+- the macros' calls and the parameters coloured
+- a parameter no call of the project passes, marked, with a quick fix for a
+  name close to one the calls pass
+- **Show rendered SQL**, the whole template as the SQL it writes
+- the outline of a template, and a search for a macro or a template
+
+In Python, the template name in `db.sql("...")` completes and links to its
+file, and a value the template does not read is marked.
 
 ```console
 $ pip install sqlakit-lsp

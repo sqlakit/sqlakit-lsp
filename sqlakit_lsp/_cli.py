@@ -15,6 +15,8 @@ def main(argv: list[str] | None = None) -> int:
         description="The language server for SQLAKit templates, over stdio.",
     )
     parser.add_argument("--version", action="version", version=version("sqlakit-lsp"))
+    # Some editors pass it to every server: stdio is the only way this one talks.
+    parser.add_argument("--stdio", action="store_true", help=argparse.SUPPRESS)
     parser.parse_args(argv)
     serve()  # pragma: no cover - run by an editor
     return 0  # pragma: no cover
