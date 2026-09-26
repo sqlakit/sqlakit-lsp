@@ -45,7 +45,7 @@ def large(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "from pathlib import Path\n\nfrom sqlakit import Database\n"
         "from sqlakit.sql import Templates\n\n"
         'db = Database("postgresql://x/y", templates=Templates('
-        'Path(__file__).parent / "sql", macros=["app.macros"]))\n'
+        'Path(__file__).parent / "sql", macros=["app.macros"], engine="tpl"))\n'
     )
     (root / "app" / "sql" / "_macros.sql").write_text(
         "\n".join(
