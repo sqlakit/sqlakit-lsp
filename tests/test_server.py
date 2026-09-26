@@ -41,7 +41,7 @@ HERE = Path(__file__).parent
 
 db = Database(
     os.environ["DATABASE_URL"],
-    templates=Templates(HERE / "sql", engine="tpl", macros=[HERE / "_macros.sql"]),
+    templates=Templates(HERE / "sql", macros=[HERE / "_macros.sql"]),
 )
 """
 
@@ -84,7 +84,6 @@ db = Database(
     "sqlite://",
     templates=Templates(
         BASE_DIR,
-        engine="tpl",
         macros=["shop.macros", BASE_DIR / "_macros.sql"],
         namespace="q",
     ),
