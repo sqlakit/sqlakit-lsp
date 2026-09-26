@@ -1,6 +1,7 @@
 """The server: what an editor is told about a project's templates."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -151,7 +152,7 @@ def test_a_template_found_in_the_code_is_checked(app: Path) -> None:
     path = app / "shop" / "sql" / "users.sql"
     assert helper.diagnose(path, path.read_text()) == []
     [found] = helper.diagnose(path, "SELECT q.sided('up')")
-    assert found.message == "q.sided: argument 1 is 'left' or 'right', got 'up'"
+    assert found.message == "q.sided: argument 1 must be 'left' or 'right', got 'up'"
     assert helper.definition("WHERE q.owned(:t)", 8) == Target(
         app / "shop" / "macros.py", 7, 4
     )
@@ -177,7 +178,7 @@ def test_an_argument_is_marked_where_it_is(
     source = "WHERE tpl.mine( teams )"
     [found] = assistant.diagnose(project / "sql" / "new.sql", source)
     assert found == Diagnostic(
-        16, 21, "tpl.mine: argument 1 must be a :parameter, got 'teams'"
+        16, 21, "tpl.mine: argument 1 must be a `:parameter`, got 'teams'"
     )
 
 
@@ -394,6 +395,51 @@ async def test_the_server_answers_an_editor(project: Path) -> None:
     await client.stop()
 
 
+@pytest.mark.anyio
+async def test_a_definition_is_a_link_for_an_editor_that_takes_one(
+    project: Path,
+) -> None:
+    from lsprotocol import types
+    from pygls.lsp.client import LanguageClient
+
+    client = LanguageClient("test", "1")
+    await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    await client.initialize_async(
+        types.InitializeParams(
+            capabilities=types.ClientCapabilities(
+                text_document=types.TextDocumentClientCapabilities(
+                    definition=types.DefinitionClientCapabilities(link_support=True)
+                )
+            ),
+            root_uri=project.as_uri(),
+        )
+    )
+    client.initialized(types.InitializedParams())
+    text = "SELECT 1 WHERE tpl.mine(:t)"
+    uri = (project / "sql" / "mine.sql").as_uri()
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(types.TextDocumentItem(uri, "sql", 1, text))
+    )
+
+    found = await client.text_document_definition_async(
+        types.DefinitionParams(
+            types.TextDocumentIdentifier(uri), types.Position(0, text.index("mine"))
+        )
+    )
+
+    assert isinstance(found, list)
+    [link] = found
+    assert isinstance(link, types.LocationLink)
+    origin = link.origin_selection_range
+    assert origin is not None
+    assert (origin.start.character, origin.end.character) == (15, 23)
+    assert text[15:23] == "tpl.mine"
+
+    await client.shutdown_async(None)
+    client.exit(None)
+    await client.stop()
+
+
 def test_sql_macros_complete_and_hover_like_the_others(assistant: _Assistant) -> None:
     source = "WHERE tpl.for_"
     assert assistant.complete(source, len(source)) == [
@@ -593,11 +639,142 @@ def test_references_read_what_the_editor_holds(
     first = text.index("mine")
     second = text.index("mine", first + 1)
 
-    found = assistant.references(
-        good, text, first, lambda path: text if path == good else path.read_text()
-    )
+    found = assistant.references(good, text, first, {good.resolve(): text})
 
     assert [(place.start, place.end) for place in found] == [
         (first, first + 4),
         (second, second + 4),
     ]
+
+
+FILE_MACRO = '''from typing import Any
+
+from sqlakit.sql import Param, Sql, sql_macro
+
+
+@sql_macro("tenant.sql")
+def of_team(row: Sql, team: Param) -> dict[str, Any]:
+    """Rows of the team."""
+    return {"team_id": team.value}
+'''
+
+
+def test_the_sql_of_a_file_macro_finds_its_calls(project: Path) -> None:
+    (project / "tenant_macros.py").write_text(FILE_MACRO)
+    (project / "tenant.sql").write_text(
+        "SELECT row.team_id = :team_id AS of_team FROM row;\n"
+    )
+    (project / "sql" / "team.sql").write_text(
+        "SELECT 1 FROM t WHERE tpl.of_team(t, :team)"
+    )
+    assistant = _Assistant(load_project(project))
+    tenant = project / "tenant.sql"
+    source = tenant.read_text()
+
+    found = assistant.references(tenant, source, source.index("of_team") + 2)
+
+    assert assistant.applies_to(tenant)
+    assert assistant.diagnose(tenant, source) == []
+    assert places(project, found) == [("sql/team.sql", "of_team")]
+
+
+def test_references_read_a_file_again_only_when_it_changes(
+    assistant: _Assistant, project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlakit_lsp._server as server
+
+    read: list[Path] = []
+    original = server._read
+    monkeypatch.setattr(
+        server, "_read", lambda path: read.append(path) or original(path)
+    )
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+    at = source.index("mine")
+
+    assistant.references(good, source, at)
+    first = len(read)
+    assistant.references(good, source, at)
+    again = len(read) - first
+    good.write_text(source + "\n  AND tpl.mine(:more)")
+    os.utime(good, ns=(good.stat().st_atime_ns, good.stat().st_mtime_ns + 1_000_000))
+    changed = assistant.references(good, good.read_text(), at)
+
+    assert (first > 0, again) == (True, 0)
+    assert places(project, changed) == [
+        ("sql/good.sql", "mine"),
+        ("sql/good.sql", "mine"),
+    ]
+
+
+def test_a_definition_starts_from_the_name_under_the_cursor(
+    assistant: _Assistant,
+) -> None:
+    sql = "SELECT *\nFROM tpl.include('inner.sql') AS i\nWHERE tpl.identifier(:c, id)"
+    code = 'rows = db.sql("inner.sql").all()'
+
+    def spanned(source: str, offset: int, *, python: bool = False) -> str | None:
+        span = assistant.origin(source, offset, python=python)
+        return None if span is None else source[span[0] : span[1]]
+
+    assert spanned(sql, sql.index("inner")) == "inner.sql"
+    assert spanned(sql, sql.index("identifier") + 3) == "tpl.identifier"
+    assert spanned(sql, sql.index("id)")) is None
+    assert spanned(code, code.index("inner") + 1, python=True) == "inner.sql"
+
+
+def test_a_macro_defined_under_the_cursor_is_its_own_definition(
+    assistant: _Assistant, project: Path
+) -> None:
+    macros = project / "_macros.sql"
+    sql = macros.read_text()
+    python = project / "lsp_macros.py"
+    code = python.read_text()
+    at_alias = sql.index("AS for_team") + 5
+    at_def = code.index("def mine") + 5
+
+    alias = assistant.definition(sql, at_alias, macros)
+    function = assistant.python_definition(code, at_def, python)
+
+    assert alias == Target(macros, 1, sql.splitlines()[1].index("for_team"))
+    assert function == Target(python, 5, 4)
+    assert assistant.origin(sql, at_alias, path=macros) == (
+        sql.index("for_team", at_alias - 5),
+        sql.index("for_team", at_alias - 5) + len("for_team"),
+    )
+    assert assistant.definition(sql, sql.index("t.team"), macros) is None
+
+
+def test_a_call_under_tpl_is_marked_when_the_namespace_is_another(
+    project: Path,
+) -> None:
+    (project / "db.py").write_text(
+        DB.replace('"_macros.sql"]', '"_macros.sql"], namespace="t"')
+    )
+    assistant = _Assistant(load_project(project))
+    source = "SELECT 1 WHERE tpl.if_set(:a, TRUE)"
+
+    [found] = assistant.diagnose(project / "sql" / "new.sql", source)
+
+    assert source[found.start : found.end] == "tpl.if_set"
+    assert found.message == (
+        "`tpl.if_set` is not a macro call: the namespace is `t`, so write `t.if_set`"
+    )
+
+
+def test_a_file_macro_goes_between_its_function_and_its_sql(project: Path) -> None:
+    (project / "tenant_macros.py").write_text(FILE_MACRO)
+    (project / "tenant.sql").write_text(
+        "-- Rows of the team.\nSELECT row.team_id = :team_id AS of_team FROM row;\n"
+    )
+    assistant = _Assistant(load_project(project))
+    python, sql = project / "tenant_macros.py", project / "tenant.sql"
+    code, text = python.read_text(), sql.read_text()
+
+    from_sql = assistant.implementation(sql, text, text.index("of_team") + 1)
+    from_python = assistant.implementation(python, code, code.index("def of_team") + 5)
+
+    assert from_sql == Target(python, 6, 4)
+    assert assistant.definition(text, text.index("of_team") + 1, sql) == from_sql
+    assert from_python == Target(sql, 1, text.splitlines()[1].index("of_team"))
+    assert assistant.implementation(sql, text, text.index("row.")) is None
