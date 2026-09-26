@@ -1100,6 +1100,33 @@ async def test_a_rename_reaches_the_editor_as_one_edit(project: Path) -> None:
     await client.stop()
 
 
+@pytest.mark.parametrize("same_version", [True, False])
+def test_a_built_in_macro_opens_in_the_project_s_own_sqlakit(
+    project: Path, *, same_version: bool
+) -> None:
+    import importlib.metadata
+    import shutil
+
+    import sqlakit
+
+    # A server `uvx` runs imports `sqlakit` from its cache, and the project
+    # holds its own copy in `.venv`.
+    site = project / ".venv" / "lib" / "python3.13" / "site-packages"
+    shutil.copytree(Path(sqlakit.__file__).parent, site / "sqlakit")
+    installed = importlib.metadata.version("sqlakit") if same_version else "0.0.1"
+    (site / f"sqlakit-{installed}.dist-info").mkdir()
+    helper = _Assistant(load_project(project))
+
+    target = helper.definition("WHERE tpl.if_set(:q, TRUE)", 8)
+
+    assert target is not None
+    library = (
+        (site / "sqlakit").resolve() if same_version else Path(sqlakit.__file__).parent
+    )
+    assert target.path.parent.resolve() == library.resolve()
+    assert target.path.name == "_sql.py"
+
+
 def test_a_built_in_macro_is_referenced_from_its_def(
     assistant: _Assistant, project: Path
 ) -> None:
