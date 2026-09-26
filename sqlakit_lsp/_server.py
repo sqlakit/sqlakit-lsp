@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import difflib
 import inspect
 import re
 import tempfile
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
@@ -41,6 +42,7 @@ from pygls.lsp.server import LanguageServer
 from sqlakit._project import Project, load_project
 from sqlakit._sql import (
     INCLUDE,
+    NAMESPACE,
     Context,
     Macro,
     MacroTemplate,
@@ -176,6 +178,57 @@ class RequestFailed(JsonRpcException):
 
 
 @dataclass(frozen=True, slots=True)
+class Symbol:
+    """A name a file holds, for its outline: a macro, a template or a parameter."""
+
+    name: str
+    kind: str
+    start: int
+    end: int
+    detail: str = ""
+
+
+def _word_span(
+    source: str, word: str, at: tuple[int, int] | None
+) -> tuple[int, int] | None:
+    """Return where a name stands in the text: on its line when it is known."""
+    if at is not None:
+        start = _line_span(source, at[0])[0] + at[1]
+        if source[start : start + len(word)].lower() == word:
+            return start, start + len(word)
+    found = re.search(rf"\b{re.escape(word)}\b", source, re.IGNORECASE)
+    return None if found is None else found.span()
+
+
+@dataclass(frozen=True, slots=True)
+class Fix:
+    """A name to write in place of a span of text, and what the editor calls it."""
+
+    title: str
+    start: int
+    end: int
+    text: str
+
+
+_NOT_READ = re.compile(r"`\w+` is not a parameter of `(?P<template>[^`]+)`")
+
+
+def _similar(
+    written: str,
+    names: Sequence[str],
+    start: int,
+    end: int,
+    namespace: str | None = None,
+) -> list[Fix]:
+    """Return a fix for each name close to the one written, the closest first."""
+    shown = f"{namespace}." if namespace else ""
+    return [
+        Fix(f"Write `{shown}{name}`", start, end, name)
+        for name in difflib.get_close_matches(written, names, n=3, cutoff=0.6)
+    ]
+
+
+@dataclass(frozen=True, slots=True)
 class Signature:
     """A macro's call as a template writes it, and the argument being written."""
 
@@ -206,6 +259,8 @@ class _Scan:
     """The file's modification time when it was read, or 0 for unsaved text."""
     macros: dict[str, list[tuple[int, int]]]
     templates: dict[str, list[tuple[int, int]]]
+    calls: dict[str, list[_TemplateCall]] = field(default_factory=dict)
+    """The calls of Python that read each template, with what they pass."""
 
 
 _PYTHON_CALL = re.compile(r"(?<![\w.])tpl\.(\w+)")
@@ -222,6 +277,12 @@ RENDER = "sqlakit.render"
 _RENDERED = Path(tempfile.gettempdir()) / "sqlakit-rendered"
 """Where rendered templates are written: outside the project, as they are
 nothing to keep."""
+
+_LISTED = 10
+"""The most calls a hover lists by name, the rest counted."""
+
+_SYMBOLS = 200
+"""The most names a search of the project answers with: the editor narrows."""
 
 _COMPILES = 64
 """How many texts of templates stay read: the ones the editor has open, mostly."""
@@ -258,6 +319,7 @@ class _Assistant:
         }
         """The files `@sql_macro("file.sql")` keeps its SQL in."""
         self._sources: set[Path] | None = None
+        self._everything: list[tuple[str, str, Target, str]] | None = None
         self._compiles: OrderedDict[tuple[str, str], Any] = OrderedDict()
         self._names: list[str] | None = None
         self._files: tuple[list[Path], list[Path]] | None = None
@@ -299,7 +361,7 @@ class _Assistant:
 
     def forget_files(self) -> None:
         """Read the list of templates and Python files again on the next request."""
-        self._names = self._files = None
+        self._names = self._files = self._everything = None
 
     def names(self) -> list[str]:
         """Every template's name, read once until `forget_files`."""
@@ -379,6 +441,109 @@ class _Assistant:
             if path is None or path.stat().st_mtime != mtime:
                 return True
         return False
+
+    def symbols(self, path: Path, source: str) -> list[Symbol]:
+        """Return what a file holds, for an editor's outline of it.
+
+        A file of macros holds its macros. A template holds the templates it
+        includes, the macros it calls and its parameters, each once, where it
+        first stands.
+        """
+        if self.holds_macros(path):
+            return self._macro_symbols(path, source)
+        namespace = self.project.templates.namespace
+        found: list[Symbol] = []
+        seen: set[str] = set()
+
+        def once(key: str, symbol: Symbol) -> None:
+            if key not in seen:
+                seen.add(key)
+                found.append(symbol)
+
+        for match in self._include_path.finditer(source):
+            once(
+                f"include {match.group(1)}",
+                Symbol(match.group(1), "template", *match.span(1)),
+            )
+        for match in self._name_at.finditer(source):
+            name = match.group(2).lower()
+            if name != INCLUDE:
+                once(
+                    f"macro {name}",
+                    Symbol(f"{namespace}.{name}", "macro", *match.span()),
+                )
+        for match in _PARAMETERS.finditer(source):
+            once(
+                f"param {match.group(1)}",
+                Symbol(f":{match.group(1)}", "parameter", *match.span()),
+            )
+        return found
+
+    def _macro_symbols(self, path: Path, source: str) -> list[Symbol]:
+        """Return each macro a file of macros defines, where its name stands."""
+        resolved = path.resolve()
+        namespace = self.project.templates.namespace
+        found = []
+        for macro in self.project.templates.macros.values():
+            written = getattr(macro, "sql_path", None) or getattr(macro, "path", None)
+            if written is None or Path(written).resolve() != resolved:
+                continue
+            span = _word_span(source, macro.name, getattr(macro, "name_at", None))
+            if span is not None:
+                detail = signature_of(macro, namespace)
+                found.append(Symbol(macro.name, "macro", *span, detail))
+        return found
+
+    def workspace_symbols(self, query: str) -> list[tuple[str, str, Target, str]]:
+        """Return the macros and the templates whose names hold the query."""
+        if self._everything is None:
+            namespace = self.project.templates.namespace
+            everything = [
+                (
+                    f"{namespace}.{macro.name}",
+                    "macro",
+                    target,
+                    signature_of(macro, namespace),
+                )
+                for macro in self.project.templates.macros.values()
+                if (target := _source_of(macro)) is not None
+            ]
+            everything.extend(
+                (name, "template", Target(path, 0), "")
+                for name in self.names()
+                if (path := self.project.path_of(name)) is not None
+            )
+            self._everything = everything
+        wanted = query.lower()
+        return [one for one in self._everything if wanted in one[0].lower()][:_SYMBOLS]
+
+    def fixes(self, source: str, start: int, end: int, message: str) -> list[Fix]:
+        """Return what could replace the text of a problem this server reported.
+
+        A call under `tpl` when the namespace is another, an unknown macro, an
+        unknown template and a value a template does not read each have the
+        names they could have meant.
+        """
+        namespace = self.project.templates.namespace
+        text = source[start:end]
+        if "is not a macro call: the namespace is" in message:
+            prefix = start + len(NAMESPACE) + 1
+            called = source[prefix:end]
+            return [
+                Fix(f"Write `{namespace}.{called}`", start, prefix, f"{namespace}.")
+            ]
+        if message.lower().startswith("unknown macro"):
+            found = self._name_at.search(source, start, end)
+            if found is None:
+                return []
+            names = [*self.project.templates.macros, INCLUDE]
+            return _similar(found.group(2), names, *found.span(2), namespace)
+        if message.startswith("No SQL template named"):
+            return _similar(text, self.names(), start, end)
+        if (named := _NOT_READ.match(message)) is not None:
+            reads = self.parameters(named.group("template")) or frozenset()
+            return _similar(text, sorted(reads), start, end)
+        return []
 
     def rendered(self, path: Path, source: str) -> str:
         """Return the whole template as the database gets it, on the project's dialect.
@@ -489,6 +654,56 @@ class _Assistant:
             for caption, sql in (("given", given), ("not given", missing))
             if sql
         )
+
+    def passes(
+        self, name: str, param: str
+    ) -> tuple[list[tuple[Path, int]], list[tuple[Path, int]]]:
+        """Return the calls of Python that pass a template's parameter, and not.
+
+        Each is a file and a line. A call that passes values it does not name,
+        `**values` or a context, counts as one that may pass it.
+        """
+        passing, silent = [], []
+        for path in self._project_files()[1]:
+            for call in self._scan(path, None).calls.get(name, ()):
+                named = {keyword for keyword, _, _ in call.keywords}
+                where = (path, call.line)
+                (passing if call.open or param in named else silent).append(where)
+        return passing, silent
+
+    def parameter_hover(self, path: Path, source: str, offset: int) -> str | None:
+        """Return which calls pass the parameter under the offset, and which not."""
+        name = self.project.name_of(path)
+        found = next(
+            (
+                match
+                for match in _PARAMETERS.finditer(source)
+                if match.start() <= offset <= match.end()
+            ),
+            None,
+        )
+        if name is None or found is None:
+            return None
+        param = found.group(1)
+        passing, silent = self.passes(name, param)
+        root = self.project.root
+
+        def listed(places: list[tuple[Path, int]]) -> str:
+            shown = [
+                f"- `{_relative(path, root)}:{line}`" for path, line in places[:_LISTED]
+            ]
+            if len(places) > _LISTED:
+                shown.append(f"- and {len(places) - _LISTED} more")
+            return "\n".join(shown)
+
+        parts = [f"`:{param}` of `{name}`"]
+        if passing:
+            parts.append(f"Passed by {len(passing)}:\n\n{listed(passing)}")
+        if silent:
+            parts.append(f"Not passed by {len(silent)}:\n\n{listed(silent)}")
+        if not passing and not silent:
+            parts.append("No call in the project's Python reads this template.")
+        return "\n\n".join(parts)
 
     def signature(self, source: str, offset: int) -> Signature | None:
         """Return the macro whose arguments the offset is in, and which one it is."""
@@ -939,13 +1154,16 @@ class _Assistant:
         if path.suffix == ".py":
             for match in _PYTHON_CALL.finditer(text):
                 macros.setdefault(match.group(1).lower(), []).append(match.span(1))
-            for start, end, name in _template_names(text):
-                templates.setdefault(name, []).append((start, end))
-        else:
-            for match in self._name_at.finditer(text):
-                macros.setdefault(match.group(2).lower(), []).append(match.span(2))
-            for match in self._include_path.finditer(text):
-                templates.setdefault(match.group(1), []).append(match.span(1))
+            calls: dict[str, list[_TemplateCall]] = {}
+            for call in _template_calls(text):
+                calls.setdefault(call.name, []).append(call)
+                if call.span is not None:
+                    templates.setdefault(call.name, []).append(call.span)
+            return _Scan(stamp, macros, templates, calls)
+        for match in self._name_at.finditer(text):
+            macros.setdefault(match.group(2).lower(), []).append(match.span(2))
+        for match in self._include_path.finditer(text):
+            templates.setdefault(match.group(1), []).append(match.span(1))
         return _Scan(stamp, macros, templates)
 
     def _project_files(self) -> tuple[list[Path], list[Path]]:
@@ -1068,6 +1286,9 @@ class _TemplateCall:
     """Each keyword's name, and where it is written."""
     open: bool
     """Whether it passes values the code does not name: `**values` or a context."""
+    line: int = 1
+    span: tuple[int, int] | None = None
+    """Where the template's name is written, without its quotes."""
 
 
 def _template_calls(source: str) -> list[_TemplateCall]:
@@ -1099,12 +1320,22 @@ def _template_calls(source: str) -> list[_TemplateCall]:
                 continue
             start = _char_offset(source, starts, keyword.lineno, keyword.col_offset)
             keywords.append((keyword.arg, start, start + len(keyword.arg)))
+        named = node.args[0]
+        value = str(named.value) if isinstance(named, ast.Constant) else ""
+        span = None
+        if named.end_lineno is not None and named.end_col_offset is not None:
+            start = _char_offset(source, starts, named.lineno, named.col_offset)
+            end = _char_offset(source, starts, named.end_lineno, named.end_col_offset)
+            quote = source.find(value, start, end)
+            span = None if quote < 0 else (quote, quote + len(value))
         found.append(
             _TemplateCall(
-                node.args[0].value,
+                value,
                 tuple(keywords),
                 len(node.args) > 1
                 or any(keyword.arg in (None, "context") for keyword in node.keywords),
+                node.lineno,
+                span,
             )
         )
     return found
@@ -1452,7 +1683,10 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         text = (
             None
             if found is None or found.python
-            else found.helper.hover(
+            else found.helper.parameter_hover(
+                _path(params.text_document.uri), found.source, found.offset
+            )
+            or found.helper.hover(
                 found.source, found.offset, _path(params.text_document.uri)
             )
         )
@@ -1665,11 +1899,14 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         """
         helper = assistant()
         path = _path(params.text_document.uri)
-        if helper is None or helper.project.name_of(path) is None:
-            return None
-        if helper.holds_macros(path) or not path.name.endswith(".sql"):
+        if helper is None:
             return None
         uri = params.text_document.uri
+        actions = fixes(ls, params)
+        if helper.project.name_of(path) is None or helper.holds_macros(path):
+            return actions or None
+        if not path.name.endswith(".sql"):
+            return actions or None
         action = types.CodeAction(title=SHOW, kind=types.CodeActionKind.Empty)
         if shows_documents(ls):
             action.command = types.Command(title=SHOW, command=RENDER, arguments=[uri])
@@ -1677,7 +1914,43 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             action.data = {"uri": uri}
         else:
             action.edit = rendered_edit(ls, uri)
-        return [action]
+        return [*actions, action]
+
+    def fixes(ls: LanguageServer, params: Any) -> list[types.CodeAction]:  # noqa: ANN401
+        """Return a quick fix for each problem of ours the editor sends along.
+
+        Only the problems at the cursor come with the request, so nothing is
+        looked for where there is nothing wrong.
+        """
+        helper = assistant()
+        ours = [one for one in params.context.diagnostics if one.source == "sqlakit"]
+        if helper is None or not ours:
+            return []
+        uri = params.text_document.uri
+        source = ls.workspace.get_text_document(uri).source
+        found = []
+        for problem in ours:
+            start = offset_of(
+                source, problem.range.start.line, problem.range.start.character
+            )
+            end = offset_of(source, problem.range.end.line, problem.range.end.character)
+            for fix in helper.fixes(source, start, end, problem.message):
+                edit = types.TextEdit(
+                    types.Range(
+                        types.Position(*position_of(source, fix.start)),
+                        types.Position(*position_of(source, fix.end)),
+                    ),
+                    fix.text,
+                )
+                found.append(
+                    types.CodeAction(
+                        title=fix.title,
+                        kind=types.CodeActionKind.QuickFix,
+                        diagnostics=[problem],
+                        edit=types.WorkspaceEdit(changes={uri: [edit]}),
+                    )
+                )
+        return found
 
     @server.feature(types.CODE_ACTION_RESOLVE)
     def resolve_action(ls: LanguageServer, action: types.CodeAction) -> Any:  # noqa: ANN401
@@ -1699,6 +1972,56 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
     @server.feature(types.WORKSPACE_DID_CHANGE_CONFIGURATION)
     def configured(_ls: LanguageServer, _params: Any) -> None:  # noqa: ANN401
         """Take the settings an editor sends: the server has none."""
+
+    symbol_kinds = {
+        "macro": types.SymbolKind.Function,
+        "template": types.SymbolKind.File,
+        "parameter": types.SymbolKind.Variable,
+    }
+
+    @server.feature(types.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
+    def document_symbols(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        helper = assistant()
+        path = _path(params.text_document.uri)
+        if helper is None or not helper.applies_to(path):
+            return None
+        source = ls.workspace.get_text_document(params.text_document.uri).source
+        found = []
+        for one in helper.symbols(path, source):
+            place = types.Range(
+                types.Position(*position_of(source, one.start)),
+                types.Position(*position_of(source, one.end)),
+            )
+            found.append(
+                types.DocumentSymbol(
+                    name=one.name,
+                    kind=symbol_kinds[one.kind],
+                    range=place,
+                    selection_range=place,
+                    detail=one.detail or None,
+                )
+            )
+        return found
+
+    @server.feature(types.WORKSPACE_SYMBOL)
+    def workspace_symbols(_ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        helper = assistant()
+        if helper is None:
+            return None
+        found = []
+        for name, kind, target, detail in helper.workspace_symbols(params.query):
+            start = types.Position(target.line, _utf16_column(target))
+            found.append(
+                types.SymbolInformation(
+                    name=name,
+                    kind=symbol_kinds[kind],
+                    location=types.Location(
+                        target.path.resolve().as_uri(), types.Range(start, start)
+                    ),
+                    container_name=detail or None,
+                )
+            )
+        return found
 
     @server.feature(types.TEXT_DOCUMENT_DOCUMENT_LINK)
     def document_link(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401

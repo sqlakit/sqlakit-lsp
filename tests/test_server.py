@@ -14,6 +14,7 @@ from sqlakit_lsp._server import (
     RENDER,
     Completion,
     Diagnostic,
+    Fix,
     Reference,
     Target,
     _Assistant,
@@ -1214,6 +1215,171 @@ async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
     [text] = filled.edits
     assert isinstance(text, types.TextEdit)
     assert text.new_text.startswith("-- good.sql on postgresql\n")
+    await client.shutdown_async(None)
+    client.exit(None)
+    await client.stop()
+
+
+def fixed(source: str, found: list[Fix]) -> list[tuple[str, str]]:
+    """Return each fix as its title, and the text with it written in."""
+    return [
+        (fix.title, source[: fix.start] + fix.text + source[fix.end :]) for fix in found
+    ]
+
+
+def test_a_problem_offers_the_names_it_could_have_meant(
+    assistant: _Assistant, project: Path
+) -> None:
+    template = project / "sql" / "new.sql"
+    macro = "SELECT 1 WHERE tpl.if_sett(:a, TRUE)"
+    code = 'db.sql("goood.sql", teams=[1], team=1)\n'
+    [unknown] = assistant.diagnose(template, macro)
+    [missing] = assistant.python_diagnose(code)
+
+    def offered(source: str, problem: Diagnostic) -> list[tuple[str, str]]:
+        return fixed(
+            source,
+            assistant.fixes(source, problem.start, problem.end, problem.message),
+        )
+
+    assert offered(macro, unknown)[0] == (
+        "Write `tpl.if_set`",
+        "SELECT 1 WHERE tpl.if_set(:a, TRUE)",
+    )
+    assert offered(code, missing) == [
+        ("Write `good.sql`", 'db.sql("good.sql", teams=[1], team=1)\n')
+    ]
+
+
+def test_a_value_the_template_does_not_read_offers_one_it_does(
+    assistant: _Assistant,
+) -> None:
+    code = 'db.sql("good.sql", teams=[1], qq=1)\n'
+    [extra] = assistant.python_diagnose(code)
+
+    found = assistant.fixes(code, extra.start, extra.end, extra.message)
+
+    assert fixed(code, found) == [("Write `q`", 'db.sql("good.sql", teams=[1], q=1)\n')]
+
+
+def test_a_call_under_another_namespace_is_fixed_to_this_one(project: Path) -> None:
+    (project / "db.py").write_text(
+        DB.replace('"_macros.sql"]', '"_macros.sql"], namespace="t"')
+    )
+    assistant = _Assistant(load_project(project))
+    source = "SELECT 1 WHERE tpl.if_set(:a, TRUE)"
+    [found] = assistant.diagnose(project / "sql" / "new.sql", source)
+
+    fix = assistant.fixes(source, found.start, found.end, found.message)
+
+    assert fixed(source, fix) == [
+        ("Write `t.if_set`", "SELECT 1 WHERE t.if_set(:a, TRUE)")
+    ]
+
+
+def test_a_file_outlines_what_it_holds(assistant: _Assistant, project: Path) -> None:
+    macros = project / "_macros.sql"
+    good = project / "sql" / "good.sql"
+    outer = project / "sql" / "outer.sql"
+
+    def outline(path: Path) -> list[tuple[str, str, str]]:
+        source = path.read_text()
+        return [
+            (one.name, one.kind, source[one.start : one.end])
+            for one in assistant.symbols(path, source)
+        ]
+
+    assert outline(macros) == [
+        ("for_team", "macro", "for_team"),
+        ("visible", "macro", "visible"),
+    ]
+    assert outline(good) == [
+        ("tpl.mine", "macro", "tpl.mine"),
+        ("tpl.if_set", "macro", "tpl.if_set"),
+        (":teams", "parameter", ":teams"),
+        (":q", "parameter", ":q"),
+    ]
+    assert outline(outer) == [("inner.sql", "template", "inner.sql")]
+
+
+def test_the_project_is_searched_for_macros_and_templates(
+    assistant: _Assistant,
+) -> None:
+    found = [(name, kind) for name, kind, _, _ in assistant.workspace_symbols("in")]
+
+    assert ("tpl.mine", "macro") in found
+    assert ("tpl.in_list", "macro") in found
+    assert ("inner.sql", "template") in found
+    assert all("in" in name.lower() for name, _ in found)
+
+
+def test_a_parameter_hovers_with_the_calls_that_pass_it(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(
+        "from db import db\n\n"
+        'one = db.sql("good.sql", teams=[1], q="a").all()\n'
+        'two = db.sql("good.sql", teams=[2]).all()\n'
+        'three = db.sql("good.sql", **values).all()\n'
+    )
+    assistant.forget_files()
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+
+    shown = assistant.parameter_hover(good, source, source.index(":q") + 1)
+
+    assert shown == (
+        "`:q` of `good.sql`\n\n"
+        "Passed by 2:\n\n- `handlers.py:3`\n- `handlers.py:5`\n\n"
+        "Not passed by 1:\n\n- `handlers.py:4`"
+    )
+    assert assistant.parameter_hover(good, source, source.index("SELECT")) is None
+
+
+@pytest.mark.anyio
+async def test_a_quick_fix_comes_with_the_problem_it_fixes(project: Path) -> None:
+    from lsprotocol import types
+    from pygls.lsp.client import LanguageClient
+
+    client = LanguageClient("test", "1")
+    published: asyncio.Future[types.PublishDiagnosticsParams] = (
+        asyncio.get_running_loop().create_future()
+    )
+
+    @client.feature(types.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)
+    def diagnostics(params: types.PublishDiagnosticsParams) -> None:
+        if not published.done():
+            published.set_result(params)
+
+    await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    await client.initialize_async(
+        types.InitializeParams(
+            capabilities=types.ClientCapabilities(), root_uri=project.as_uri()
+        )
+    )
+    client.initialized(types.InitializedParams())
+    uri = (project / "sql" / "typo.sql").as_uri()
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(
+            types.TextDocumentItem(
+                uri, "sql", 1, "SELECT 1 WHERE tpl.if_sett(:a, TRUE)"
+            )
+        )
+    )
+    [problem] = (await asyncio.wait_for(published, 10)).diagnostics
+
+    actions = await client.text_document_code_action_async(
+        types.CodeActionParams(
+            types.TextDocumentIdentifier(uri),
+            problem.range,
+            types.CodeActionContext(diagnostics=[problem]),
+        )
+    )
+
+    assert [action.title for action in actions or []] == [
+        "Write `tpl.if_set`",
+        "Show rendered SQL",
+    ]
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()

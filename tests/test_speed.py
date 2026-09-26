@@ -104,6 +104,9 @@ def test_the_requests_an_editor_sends_most_stay_within_budget(
     code = python.read_text()
     macro = source.index("m0(") + 1
     keys = itertools.count()
+    macros = large / "app" / "sql" / "_macros.sql"
+    broken = source.replace("tpl.m0(", "tpl.m00(")
+    [unknown] = assistant.diagnose(template, broken)
     requests = {
         # A keystroke makes new text, which no cache holds.
         "diagnose": lambda: assistant.diagnose(template, f"{source}-- {next(keys)}"),
@@ -115,6 +118,15 @@ def test_the_requests_an_editor_sends_most_stay_within_budget(
         "references": lambda: assistant.references(template, source, macro),
         "python_diagnose": lambda: assistant.python_diagnose(code),
         "python_complete": lambda: assistant.python_complete('db.sql("d1/', 11),
+        "fixes": lambda: assistant.fixes(
+            broken, unknown.start, unknown.end, unknown.message
+        ),
+        "outline": lambda: assistant.symbols(template, source),
+        "outline_macros": lambda: assistant.symbols(macros, macros.read_text()),
+        "search": lambda: assistant.workspace_symbols("m1"),
+        "parameter_hover": lambda: assistant.parameter_hover(
+            template, source, source.index(":a")
+        ),
     }
 
     spent = {name: _median(call) for name, call in requests.items()}
