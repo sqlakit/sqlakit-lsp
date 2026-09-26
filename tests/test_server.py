@@ -452,7 +452,8 @@ def test_sql_macros_complete_and_hover_like_the_others(assistant: _Assistant) ->
         )
     ]
     assert assistant.hover("WHERE tpl.for_team(u)", 12) == (
-        "```sql\ntpl.for_team(t)\n```\n\nRows of the team the call asks for."
+        "```sql\n-- on postgresql\n(u.team = :team)\n```\n\n"
+        "`tpl.for_team(t)`: Rows of the team the call asks for."
     )
 
 
@@ -778,3 +779,66 @@ def test_a_file_macro_goes_between_its_function_and_its_sql(project: Path) -> No
     assert assistant.definition(text, text.index("of_team") + 1, sql) == from_sql
     assert from_python == Target(sql, 1, text.splitlines()[1].index("of_team"))
     assert assistant.implementation(sql, text, text.index("row.")) is None
+
+
+def test_a_value_the_template_does_not_read_is_marked(assistant: _Assistant) -> None:
+    code = 'db.sql("good.sql", teams=[1], teem=1)\n'
+    passes_through = (
+        'db.sql("good.sql", **values)\ndb.sql("good.sql", {"q": 1}, teem=1)\n'
+    )
+
+    [found] = assistant.python_diagnose(code)
+
+    assert code[found.start : found.end] == "teem"
+    assert found.message == (
+        "`teem` is not a parameter of `good.sql`, which reads `q`, `teams`."
+    )
+    assert assistant.python_diagnose(passes_through) == []
+
+
+def test_the_parameters_of_a_template_complete_in_its_call(
+    assistant: _Assistant,
+) -> None:
+    code = 'rows = db.sql(\n    "good.sql", teams=[1], '
+
+    offered = assistant.python_complete(code, len(code))
+    typed = assistant.python_complete(code + "q", len(code) + 1)
+
+    assert [(one.label, one.snippet) for one in offered] == [("q", "q=")]
+    assert [one.label for one in typed] == ["q"]
+
+
+def test_a_macro_s_arguments_show_while_they_are_written(
+    assistant: _Assistant,
+) -> None:
+    written = "SELECT *\nWHERE tpl.if_set(:q, tpl.icontains(name, :q), 'a, b'"
+
+    inner = assistant.signature(written, written.index("name") + 2)
+    outer = assistant.signature(written, len(written))
+
+    assert inner is not None
+    assert (inner.label, inner.active) == ("tpl.icontains(column, text, collation)", 0)
+    assert outer is not None
+    assert (outer.label, outer.arguments, outer.active) == (
+        "tpl.if_set(:value, expr, otherwise)",
+        (":value", "expr", "otherwise"),
+        2,
+    )
+    assert assistant.signature("SELECT count(", 13) is None
+
+
+def test_hover_shows_the_sql_a_call_writes(assistant: _Assistant) -> None:
+    source = "SELECT * FROM users WHERE tpl.if_set(:q, name = :q)"
+
+    shown = assistant.hover(source, source.index("if_set"))
+
+    assert shown == (
+        "```sql\n"
+        "-- :q given\n"
+        "name = :q\n"
+        "-- :q not given\n"
+        "TRUE\n"
+        "```\n\n"
+        "`tpl.if_set(:value, expr[, otherwise])`: `expr` when the parameter holds "
+        "a value, `otherwise` when it does not."
+    )

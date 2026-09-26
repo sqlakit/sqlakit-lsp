@@ -22,16 +22,21 @@ import ast
 import inspect
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
+import sqlalchemy as sa
+import sqlalchemy.engine.default
+import sqlalchemy.exc
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
 from sqlakit._project import Project, load_project
 from sqlakit._sql import (
     INCLUDE,
+    Context,
     Macro,
     Param,
     SqlMacro,
@@ -41,7 +46,7 @@ from sqlakit._sql import (
 from sqlakit._static import SKIPPED
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 from sqlakit.exceptions import (
     MacroArgumentError,
     MacroSyntaxError,
@@ -89,6 +94,74 @@ class Target:
     path: Path
     line: int
     column: int = 0
+
+
+def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
+    """Return the innermost macro call of a read template that holds the offset."""
+    for part in parts:
+        if isinstance(part, str) or not part.span[0] <= offset <= part.span[1]:
+            continue
+        for argument in part.args:
+            if (inner := _innermost(argument.parts, offset)) is not None:
+                return inner
+        return part
+    return None
+
+
+def _rendered(template: Any, dialect: str, values: dict[str, Any]) -> str | None:  # noqa: ANN401
+    """Return the SQL a read template writes for these values, if it can."""
+    try:
+        return template.render(Context(dialect, _preparer(dialect), values)).strip()
+    except Exception:  # noqa: BLE001 - a macro may want a value of its own kind
+        return None
+
+
+@lru_cache
+def _preparer(dialect: str) -> Any:  # noqa: ANN401
+    """Return how a dialect quotes names, loaded without a driver or a server."""
+    try:
+        return sa.engine.make_url(f"{dialect}://").get_dialect()().identifier_preparer
+    except sa.exc.NoSuchModuleError:
+        default = sa.engine.default.DefaultDialect()
+        default.name = dialect
+        return default.identifier_preparer
+
+
+def _open_brackets(source: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Return each bracket still open at ``end``, and the commas written in it.
+
+    Strings and `--` comments are passed over, so a comma in one counts for none.
+    """
+    opened: list[list[int]] = []
+    index = start
+    while index < end:
+        char = source[index]
+        if char in "'\"":
+            closing = source.find(char, index + 1)
+            index = end if closing < 0 else closing + 1
+            continue
+        if source.startswith("--", index):
+            newline = source.find("\n", index)
+            index = end if newline < 0 else newline + 1
+            continue
+        if char == "(":
+            opened.append([index, 0])
+        elif char == ")" and opened:
+            opened.pop()
+        elif char == "," and opened:
+            opened[-1][1] += 1
+        index += 1
+    return [(bracket, commas) for bracket, commas in opened]
+
+
+@dataclass(frozen=True, slots=True)
+class Signature:
+    """A macro's call as a template writes it, and the argument being written."""
+
+    label: str
+    arguments: tuple[str, ...]
+    active: int
+    doc: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +226,7 @@ class _Assistant:
         self._names: list[str] | None = None
         self._files: tuple[list[Path], list[Path]] | None = None
         self._scans: dict[Path, _Scan] = {}
+        self._reads: dict[str, tuple[int, frozenset[str]]] = {}
 
     def forget_files(self) -> None:
         """Read the list of templates and Python files again on the next request."""
@@ -231,7 +305,67 @@ class _Assistant:
         if macro is None:
             return None
         signature = signature_of(macro, self.project.templates.namespace)
-        return f"```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
+        written = self.written(source, offset)
+        if not written:
+            return f"```sql\n{signature}\n```\n\n{macro.doc}".rstrip()
+        summary = macro.doc.split("\n\n", 1)[0].replace("\n", " ")
+        return f"```sql\n{written}\n```\n\n`{signature}`: {summary}".rstrip()
+
+    def written(self, source: str, offset: int) -> str:
+        """Return the SQL the call under the offset writes, on the project's dialect.
+
+        Once with every parameter it reads given, and once with none, when the
+        two differ. Empty when the call cannot be written without real values.
+        """
+        try:
+            template = self.project.load("<hover>", source)
+        except SQLAKitError:
+            return ""
+        call = _innermost(template.parts, offset)
+        if call is None:
+            return ""
+        text = source[call.span[0] : call.span[1]]
+        try:
+            alone = self.project.load("<hover>", text)
+        except SQLAKitError:
+            return ""
+        names = sorted(alone.parameters())
+        dialect = self.project.dialect or "postgresql"
+        given = _rendered(alone, dialect, dict.fromkeys(names, "x"))
+        missing = _rendered(alone, dialect, dict.fromkeys(names))
+        if not names or given == missing:
+            one = given or missing
+            return f"-- on {dialect}\n{one}" if one else ""
+        listed = ", ".join(f":{name}" for name in names)
+        return "\n".join(
+            f"-- {listed} {caption}\n{sql}"
+            for caption, sql in (("given", given), ("not given", missing))
+            if sql
+        )
+
+    def signature(self, source: str, offset: int) -> Signature | None:
+        """Return the macro whose arguments the offset is in, and which one it is."""
+        start = max(0, source.rfind("\n\n", 0, offset))
+        opened = _open_brackets(source, start, offset)
+        for bracket, commas in reversed(opened):
+            called = self._macro_typed.search(source, start, bracket)
+            if called is None or called.end() != bracket:
+                continue
+            macro = self.project.templates.macros.get(called.group(1).lower())
+            if macro is None:
+                return None
+            names = [
+                f":{slot.name}" if slot.kind is Param else slot.name
+                for slot in macro.slots
+            ]
+            if macro.variadic is not None:
+                variadic = macro.variadic
+                names.append(f"*{':' if variadic.kind is Param else ''}{variadic.name}")
+            active = min(commas, len(names) - 1) if names else 0
+            namespace = self.project.templates.namespace
+            label = f"{namespace}.{macro.name}({', '.join(names)})"
+            return Signature(label, tuple(names), active, macro.doc)
+        return None
 
     def definition(
         self, source: str, offset: int, path: Path | None = None
@@ -338,16 +472,54 @@ class _Assistant:
         return not any(part in SKIPPED for part in relative.parts[:-1])
 
     def python_diagnose(self, source: str) -> list[Diagnostic]:
-        """Return each template the code reads that no template directory holds."""
+        """Return what is wrong with the templates the code reads.
+
+        That is a template no template directory holds, and a value a call
+        passes by name that its template does not read.
+        """
         where = ", ".join(
             _relative(Path(root), self.project.root)
             for root in self.project.templates.paths
         )
-        return [
+        found = [
             Diagnostic(start, end, f"No SQL template named `{name}` in {where}.")
             for start, end, name in _template_names(source)
             if self.project.path_of(name) is None
         ]
+        for call in _template_calls(source):
+            reads = None if call.open else self.parameters(call.name)
+            if reads is None:
+                continue
+            listed = ", ".join(f"`{name}`" for name in sorted(reads)) or "nothing"
+            found.extend(
+                Diagnostic(
+                    start,
+                    end,
+                    f"`{name}` is not a parameter of `{call.name}`, which reads {listed}.",
+                )
+                for name, start, end in call.keywords
+                if name not in reads
+            )
+        return found
+
+    def parameters(self, name: str) -> frozenset[str] | None:
+        """Return the parameters a template reads, or None when it cannot be read.
+
+        Read once for each time its file changes.
+        """
+        path = self.project.path_of(name)
+        if path is None:
+            return None
+        stamp = path.stat().st_mtime_ns
+        cached = self._reads.get(name)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        try:
+            reads = self.project.load(name, _read(path)).parameters()
+        except SQLAKitError:
+            return None
+        self._reads[name] = (stamp, reads)
+        return reads
 
     def python_complete(self, source: str, offset: int) -> list[Completion]:
         """Return the template names that can go where the code reads one."""
@@ -357,6 +529,14 @@ class _Assistant:
                 Completion(name, "template")
                 for name in self.names()
                 if name.startswith(match.group(1))
+            ]
+        if match := _ARGUMENT_TYPED.search(source, 0, offset):
+            reads = self.parameters(match.group("name")) or frozenset()
+            passed = set(_PASSED.findall(match.group("passed")))
+            return [
+                Completion(name, "parameter", snippet=f"{name}=")
+                for name in sorted(reads - passed)
+                if name.startswith(match.group("typed"))
             ]
         return []
 
@@ -609,6 +789,64 @@ _TEMPLATE_CALLS = {"sql", "from_file", "from_sql"}
 """The calls whose first argument names a template: `db.sql(...)` and its kin."""
 
 _TEMPLATE_TYPED = re.compile(r"\.(?:sql|from_file|from_sql)\(\s*[\"']([^\"']*)$")
+
+_ARGUMENT_TYPED = re.compile(
+    r"""\.(?:sql|from_file|from_sql)\(\s*["'](?P<name>[^"']+\.sql)["']\s*,"""
+    r"(?P<passed>[^()]*?)(?:^|[\s,])(?P<typed>\w*)$",
+    re.MULTILINE,
+)
+"""A call that names a template, and the keyword being typed after its name."""
+
+_PASSED = re.compile(r"(\w+)\s*=")
+
+
+@dataclass(frozen=True, slots=True)
+class _TemplateCall:
+    """A call that reads a template, and the values it passes by name."""
+
+    name: str
+    keywords: tuple[tuple[str, int, int], ...]
+    """Each keyword's name, and where it is written."""
+    open: bool
+    """Whether it passes values the code does not name: `**values` or a context."""
+
+
+def _template_calls(source: str) -> list[_TemplateCall]:
+    """Return each call of `.sql(...)`, `.from_file(...)` or `.from_sql(...)`."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    starts = [0]
+    for line in source.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    found = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _TEMPLATE_CALLS
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value.endswith(".sql")
+        ):
+            continue
+        keywords = []
+        for keyword in node.keywords:
+            if keyword.arg is None or keyword.arg == "context":
+                continue
+            start = _char_offset(source, starts, keyword.lineno, keyword.col_offset)
+            keywords.append((keyword.arg, start, start + len(keyword.arg)))
+        found.append(
+            _TemplateCall(
+                node.args[0].value,
+                tuple(keywords),
+                len(node.args) > 1
+                or any(keyword.arg in (None, "context") for keyword in node.keywords),
+            )
+        )
+    return found
 
 
 def _template_names(source: str) -> list[tuple[int, int, str]]:
@@ -894,6 +1132,36 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
                 )
                 for one in written
             ],
+        )
+
+    @server.feature(
+        types.TEXT_DOCUMENT_SIGNATURE_HELP,
+        types.SignatureHelpOptions(trigger_characters=["(", ","]),
+    )
+    def signature_help(ls: LanguageServer, params: Any) -> Any:  # noqa: ANN401
+        found = at(ls, params)
+        signature = (
+            None
+            if found is None or found.python
+            else found.helper.signature(found.source, found.offset)
+        )
+        if signature is None:
+            return None
+        return types.SignatureHelp(
+            signatures=[
+                types.SignatureInformation(
+                    label=signature.label,
+                    documentation=types.MarkupContent(
+                        types.MarkupKind.Markdown, signature.doc
+                    ),
+                    parameters=[
+                        types.ParameterInformation(label=name)
+                        for name in signature.arguments
+                    ],
+                )
+            ],
+            active_signature=0,
+            active_parameter=signature.active,
         )
 
     @server.feature(types.TEXT_DOCUMENT_HOVER)
