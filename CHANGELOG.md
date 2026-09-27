@@ -5,8 +5,13 @@
 - **Show rendered SQL** writes `tpl.order_by(:sort, ...)` as the sort it
   falls back to, `ORDER BY name ASC`, and not as the call. A parameter a
   built-in macro cannot take made up renders as not given.
-- A macro of the project's Python stays a call in the rendered SQL, and a
-  comment on top now says so.
+- **Show rendered SQL** renders the macros of the project's Python too,
+  `tpl.search(:q, u.name, u.email)` as the `LIKE`s it writes. The server
+  reads those macros and does not run them, so it renders the template again
+  with the project's `.venv/bin/python`, which imports them. Only this action
+  runs the project's code, and only when the template calls such a macro.
+  Without a `.venv`, or when a module fails to import, the call stays a call
+  and a comment on top says why.
 
 ## 0.3.0
 

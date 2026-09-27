@@ -23,8 +23,10 @@ import asyncio
 import bisect
 import difflib
 import inspect
+import json
 import os
 import re
+import subprocess
 import tempfile
 import uuid
 from collections import OrderedDict
@@ -155,6 +157,51 @@ def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
                 return inner
         return part
     return None
+
+
+_LIVE = Path(__file__).with_name("_live.py")
+"""The script the project's interpreter renders a template with."""
+
+_LIVE_SECONDS = 20
+"""How long a render with the project's macros may take: it imports them."""
+
+
+def _interpreter(root: Path) -> Path | None:
+    """Return the Python of the project's `.venv`, if it has one."""
+    for found in (
+        root / ".venv" / "bin" / "python",
+        root / ".venv" / "Scripts" / "python.exe",
+    ):
+        if found.is_file():
+            return found
+    return None
+
+
+def _run_live(root: Path, request: dict[str, Any]) -> tuple[str | None, str]:
+    """Render a template in the project's interpreter: the SQL, or why not."""
+    python = _interpreter(root)
+    if python is None:
+        return None, "the project has no .venv to run its macros in."
+    try:
+        done = subprocess.run(  # noqa: S603 - the project's own interpreter
+            [str(python), str(_LIVE)],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            cwd=root,
+            timeout=_LIVE_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, f"running {_relative(python, root)} failed: {error}"
+    try:
+        answer = json.loads(done.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        last = (done.stderr.strip().splitlines() or ["no output"])[-1]
+        return None, f"{_relative(python, root)} failed: {last}"
+    if "sql" in answer:
+        return answer["sql"], ""
+    return None, str(answer.get("error", "no SQL came back"))
 
 
 def _calls(parts: Sequence[Any]) -> Iterator[Any]:
@@ -826,8 +873,12 @@ class _Assistant:
 
         Every parameter counts as given, so every optional part is there, and
         stays a placeholder. A parameter a built-in macro cannot take made up,
-        the column `tpl.order_by` sorts by, counts as not given. A macro of the
-        project's Python stays a call: the server reads it, and does not run it.
+        the column `tpl.order_by` sorts by, counts as not given.
+
+        The server reads the project's Python macros and does not run them, so
+        when the template calls one, it is rendered again by the project's own
+        interpreter, `.venv/bin/python`, which imports them. Without one, or
+        when that fails, the calls stay calls, and a comment on top says why.
         """
         name = self.project.name_of(path) or path.name
         dialect = self.project.dialect or "postgresql"
@@ -842,20 +893,29 @@ class _Assistant:
         if sql is None:
             return f"-- {name} cannot be written with made-up values.\n"
         namespace = self.project.templates.namespace
-        kept = sorted(
-            {
-                f"{namespace}.{call.name}"
-                for call in calls
-                if isinstance(self.project.templates.macros.get(call.name), StaticMacro)
-            }
-        )
-        note = (
-            f"-- {', '.join(kept)}: the project's Python, which the editor does "
-            "not run.\n"
-            if kept
-            else ""
-        )
-        return f"-- {name} on {dialect}\n{note}{sql}\n"
+        # A call of an included template is in the SQL too, and not in `calls`.
+        kept = {
+            key: macro
+            for key, macro in self.project.templates.macros.items()
+            if isinstance(macro, StaticMacro)
+            and re.search(rf"(?<![\w.]){namespace}\.{key}\s*\(", sql, re.IGNORECASE)
+        }
+        if not kept:
+            return f"-- {name} on {dialect}\n{sql}\n"
+        request = {
+            "root": str(self.project.root),
+            "name": name,
+            "source": source,
+            "dialect": dialect,
+            "modules": sorted({str(macro.path) for macro in kept.values()}),
+            "macros": sorted(kept),
+            "not_given": sorted(key for key, value in values.items() if value is None),
+        }
+        run, problem = _run_live(self.project.root, request)
+        if run is not None:
+            return f"-- {name} on {dialect}\n{run}\n"
+        listed = ", ".join(f"{namespace}.{key}" for key in sorted(kept))
+        return f"-- {name} on {dialect}\n-- {listed} stays a call: {problem}\n{sql}\n"
 
     def _not_given(
         self, name: str, source: str, calls: Sequence[Any], dialect: str

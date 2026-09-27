@@ -1221,9 +1221,57 @@ def test_a_whole_template_renders_with_every_part_and_its_placeholders(
 
     assert rendered == (
         "-- rows.sql on postgresql\n"
-        "-- tpl.mine: the project's Python, which the editor does not run.\n"
+        "-- tpl.mine stays a call: the project has no .venv to run its macros in.\n"
         "SELECT * FROM (VALUES (:rows__1)) AS v WHERE name = :q\n"
         "  AND tpl.mine(:teams)\n"
+    )
+
+
+def _venv(project: Path) -> None:
+    """Give the project a `.venv` whose Python is the one running the tests."""
+    bin_ = project / ".venv" / "bin"
+    bin_.mkdir(parents=True)
+    python = bin_ / "python"
+    # A script, as a link to it would not see the site-packages of its own venv.
+    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+
+
+def test_a_macro_of_the_project_renders_in_its_own_python(
+    assistant: _Assistant, project: Path
+) -> None:
+    _venv(project)
+    (project / "sql" / "outer_mine.sql").write_text(
+        "SELECT * FROM tpl.include('mine.sql') AS m WHERE tpl.mine(:teams)"
+    )
+    (project / "sql" / "mine.sql").write_text("SELECT * FROM t WHERE tpl.mine(:ids)")
+    outer = project / "sql" / "outer_mine.sql"
+
+    rendered = assistant.rendered(outer, outer.read_text())
+
+    assert rendered == (
+        "-- outer_mine.sql on postgresql\n"
+        "SELECT * FROM (SELECT * FROM t WHERE team IN :ids\n"
+        ") AS m WHERE team IN :teams\n"
+    )
+
+
+def test_a_macro_that_cannot_be_imported_says_why(
+    assistant: _Assistant, project: Path
+) -> None:
+    _venv(project)
+    macros = project / "lsp_macros.py"
+    macros.write_text("import not_installed\n" + macros.read_text())
+    rows = project / "sql" / "rows.sql"
+    rows.write_text("SELECT * FROM t WHERE tpl.mine(:teams)")
+
+    rendered = assistant.rendered(rows, rows.read_text())
+
+    assert rendered == (
+        "-- rows.sql on postgresql\n"
+        "-- tpl.mine stays a call: lsp_macros cannot be imported: "
+        "No module named 'not_installed'\n"
+        "SELECT * FROM t WHERE tpl.mine(:teams)\n"
     )
 
 
