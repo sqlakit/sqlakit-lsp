@@ -1221,8 +1221,120 @@ def test_a_whole_template_renders_with_every_part_and_its_placeholders(
 
     assert rendered == (
         "-- rows.sql on postgresql\n"
+        "-- tpl.mine stays a call: the project has no .venv to run its macros in.\n"
         "SELECT * FROM (VALUES (:rows__1)) AS v WHERE name = :q\n"
         "  AND tpl.mine(:teams)\n"
+    )
+
+
+def _venv(project: Path) -> None:
+    """Give the project a `.venv` whose Python is the one running the tests."""
+    bin_ = project / ".venv" / "bin"
+    bin_.mkdir(parents=True)
+    python = bin_ / "python"
+    # A script, as a link to it would not see the site-packages of its own venv.
+    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+
+
+def test_a_macro_of_the_project_renders_in_its_own_python(
+    assistant: _Assistant, project: Path
+) -> None:
+    _venv(project)
+    (project / "sql" / "outer_mine.sql").write_text(
+        "SELECT * FROM tpl.include('mine.sql') AS m WHERE tpl.mine(:teams)"
+    )
+    (project / "sql" / "mine.sql").write_text("SELECT * FROM t WHERE tpl.mine(:ids)")
+    outer = project / "sql" / "outer_mine.sql"
+
+    rendered = assistant.rendered(outer, outer.read_text())
+
+    assert rendered == (
+        "-- outer_mine.sql on postgresql\n"
+        "SELECT * FROM (SELECT * FROM t WHERE team IN :ids\n"
+        ") AS m WHERE team IN :teams\n"
+    )
+
+
+def test_a_file_macro_renders_the_macros_its_sql_calls(project: Path) -> None:
+    _venv(project)
+    (project / "team_macros.py").write_text(
+        "from sqlakit.sql import Param, Sql, sql_macro\n\n\n"
+        '@sql_macro("team.sql")\n'
+        "def of_team(u: Sql, team: Param) -> dict:\n"
+        '    """Rows of the team."""\n'
+        '    return {"team_id": team.value}\n'
+    )
+    (project / "team.sql").write_text(
+        "SELECT tpl.mine(:team_id) AND tpl.if_set(:team_id, u.x = :team_id)"
+        " AS of_team\nFROM u;\n"
+    )
+    helper = _Assistant(load_project(project))
+    rows = project / "sql" / "rows.sql"
+    rows.write_text("SELECT * FROM users AS u WHERE tpl.of_team(u, :team)")
+
+    rendered = helper.rendered(rows, rows.read_text())
+
+    assert rendered == (
+        "-- rows.sql on postgresql\n"
+        "SELECT * FROM users AS u WHERE "
+        "(team IN :of_team_1__team_id AND u.x = :of_team_1__team_id)\n"
+    )
+
+
+def test_a_macro_that_cannot_be_imported_says_why(
+    assistant: _Assistant, project: Path
+) -> None:
+    _venv(project)
+    macros = project / "lsp_macros.py"
+    macros.write_text("import not_installed\n" + macros.read_text())
+    rows = project / "sql" / "rows.sql"
+    rows.write_text("SELECT * FROM t WHERE tpl.mine(:teams)")
+
+    rendered = assistant.rendered(rows, rows.read_text())
+
+    assert rendered == (
+        "-- rows.sql on postgresql\n"
+        "-- tpl.mine stays a call: lsp_macros cannot be imported: "
+        "No module named 'not_installed'\n"
+        "SELECT * FROM t WHERE tpl.mine(:teams)\n"
+    )
+
+
+def test_a_parameter_a_macro_cannot_take_made_up_renders_as_not_given(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "sql" / "sorted.sql").write_text(
+        "SELECT * FROM users WHERE tpl.if_set(:q, name = :q)\n"
+        "ORDER BY tpl.order_by(:sort, id, name, 'id.desc')"
+    )
+    sorted_ = project / "sql" / "sorted.sql"
+
+    rendered = assistant.rendered(sorted_, sorted_.read_text())
+
+    assert rendered == (
+        "-- sorted.sql on postgresql\n"
+        "SELECT * FROM users WHERE name = :q\n"
+        "ORDER BY id DESC\n"
+    )
+
+
+def test_a_template_renders_with_a_question_mark_for_each_parameter(
+    assistant: _Assistant, project: Path
+) -> None:
+    marks = project / "sql" / "marks.sql"
+    marks.write_text(
+        "SELECT ':not', x::int FROM t -- :nor\n"
+        "WHERE id IN (:ids) AND tpl.if_set(:q, name = :q) LIMIT :size"
+    )
+
+    rendered = assistant.rendered_marked(marks, marks.read_text())
+
+    assert rendered == (
+        "-- marks.sql on postgresql\n"
+        "-- ? in order: :ids, :q, :size\n"
+        "SELECT ':not', x::int FROM t -- :nor\n"
+        "WHERE id IN (?) AND name = ? LIMIT ?\n"
     )
 
 
@@ -1266,16 +1378,21 @@ async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
             types.CodeActionContext(diagnostics=[]),
         )
     )
-    assert [action.title for action in actions or []] == ["Show rendered SQL"]
-    await client.workspace_execute_command_async(
-        types.ExecuteCommandParams(RENDER, [uri])
-    )
+    assert [action.title for action in actions or []] == [
+        "Show rendered SQL",
+        "Show rendered SQL with ?",
+    ]
+    for marked in (False, True):
+        await client.workspace_execute_command_async(
+            types.ExecuteCommandParams(RENDER, [uri, marked])
+        )
 
-    [opened] = shown
-    written = Path(unquote(urlparse(opened).path))
-    assert written.name == "good.sql"
-    text = await asyncio.to_thread(written.read_text)
-    assert text.startswith("-- good.sql on postgresql\n")
+    written = [Path(unquote(urlparse(opened).path)) for opened in shown]
+    assert [one.name for one in written] == ["good.sql", "good.sql"]
+    plain, marked = [await asyncio.to_thread(one.read_text) for one in written]
+    assert plain.startswith("-- good.sql on postgresql\n")
+    assert ":teams" in plain
+    assert marked.startswith("-- good.sql on postgresql\n-- ? in order: :teams")
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()
@@ -1327,7 +1444,14 @@ async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
     chosen = types.CodeAction(title="Show rendered SQL", data={"uri": uri})
     resolved = await client.code_action_resolve_async(chosen)
 
-    assert [action.title for action in actions or []] == ["Show rendered SQL"]
+    assert [
+        (action.title, action.data)
+        for action in actions or []
+        if isinstance(action, types.CodeAction)
+    ] == [
+        ("Show rendered SQL", {"uri": uri, "marked": False}),
+        ("Show rendered SQL with ?", {"uri": uri, "marked": True}),
+    ]
     assert resolved.edit is not None
     made, filled = resolved.edit.document_changes or []
     assert isinstance(made, types.CreateFile)
@@ -1623,6 +1747,7 @@ async def test_a_quick_fix_comes_with_the_problem_it_fixes(project: Path) -> Non
     assert [action.title for action in actions or []] == [
         "Write `tpl.if_set`",
         "Show rendered SQL",
+        "Show rendered SQL with ?",
     ]
     await client.shutdown_async(None)
     client.exit(None)

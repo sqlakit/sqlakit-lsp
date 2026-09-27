@@ -14,7 +14,8 @@ templates. In a `.sql` template:
 - the macros' calls and the parameters coloured
 - a parameter no call of the project passes, marked, with a quick fix for a
   name close to one the calls pass
-- **Show rendered SQL**, the whole template as the SQL it writes
+- **Show rendered SQL**, the whole template as the SQL it writes, with `:name`
+  or with `?` for each parameter
 - the outline of a template, and a search for a macro or a template
 
 In Python, the template name in `db.sql("...")` completes and links to its
