@@ -23,6 +23,7 @@ import asyncio
 import bisect
 import difflib
 import inspect
+import os
 import re
 import tempfile
 import uuid
@@ -476,8 +477,26 @@ class _Assistant:
     def names(self) -> list[str]:
         """Every template's name, read once until `forget_files`."""
         if self._names is None:
-            self._names = self.project.templates.names()
+            self._names = sorted(self._on_disk())
         return self._names
+
+    def _on_disk(self) -> dict[str, Path]:
+        """Return each template's name and file, as `Templates.names` finds them.
+
+        One walk of the directories, in strings: a file made has the next
+        keystroke read them again, and paths cost more than the walk.
+        """
+        skipped = {str(path) for path in self._macro_files | self._macro_sql}
+        found: dict[str, Path] = {}
+        for root in self._template_roots:
+            start = len(str(root)) + 1
+            for directory, _, files in os.walk(root):
+                for file in files:
+                    written = os.path.join(directory, file)  # noqa: PTH118 - strings, for speed
+                    if file.endswith(".sql") and written not in skipped:
+                        name = written[start:].replace(os.sep, "/")
+                        found.setdefault(name, Path(written))
+        return found
 
     def defines_macros(self, path: Path) -> bool:
         """Whether a file defines a macro the project calls, its own or built in.
@@ -1397,12 +1416,9 @@ class _Assistant:
         The paths are resolved, as the editor's open files are keyed.
         """
         if self._files is None:
-            named = {}
-            for name in self.names():
-                for root in self._template_roots:
-                    if (root / name).is_file():
-                        named[root / name] = name
-                        break
+            templates = self._on_disk()
+            self._names = sorted(templates)
+            named = {path: name for name, path in templates.items()}
             sql_files = [
                 *named,
                 *(path.resolve() for path in self.project.macro_files()),
