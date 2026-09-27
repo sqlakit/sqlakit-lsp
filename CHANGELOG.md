@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Go to definition on a `:parameter` goes to the calls of Python that pass
   it, and selects `page_size` in `db.sql("users/search.sql",
