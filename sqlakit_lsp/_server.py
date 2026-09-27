@@ -141,6 +141,8 @@ class Target:
     path: Path
     line: int
     column: int = 0
+    length: int = 0
+    """How many characters of the line the place spans: a name to select."""
 
 
 def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
@@ -293,10 +295,12 @@ class Passing:
     line: int
     start: int
     end: int
-    """Where the value is named: its keyword, or the template's name when the
-    call passes values it does not name."""
-    value: str | None
-    """The code of the value, or None when the call does not name it."""
+    """Where the value is: its keyword, or the code that passes values the call
+    does not name, `values` in `**values`."""
+    code: str
+    """What the call writes, `page_size=limit` or `**values`."""
+    named: bool = True
+    """Whether the call names the parameter, and does not only may pass it."""
 
 
 def _read(path: Path) -> str:
@@ -933,14 +937,15 @@ class _Assistant:
         for path, call in self._calls_reading(name):
             keyword = next((one for one in call.keywords if one.name == param), None)
             if keyword is not None:
+                code = f"{param}={keyword.value}"
                 passing.append(
-                    Passing(
-                        path, keyword.line, keyword.start, keyword.end, keyword.value
-                    )
+                    Passing(path, keyword.line, keyword.start, keyword.end, code)
                 )
             elif call.open:
-                start, end = call.span or (0, 0)
-                passing.append(Passing(path, call.line, start, end, None))
+                passing.extend(
+                    Passing(path, one.line, one.start, one.end, one.value, named=False)
+                    for one in call.unnamed
+                )
             else:
                 silent.append((path, call.line))
         return passing, silent
@@ -975,8 +980,8 @@ class _Assistant:
         def listed(places: Sequence[tuple[Path, int, str | None]]) -> str:
             shown = [
                 f"- `{_relative(path, root)}:{line}`"
-                + ("" if value is None else f" `{param}={value}`")
-                for path, line, value in places[:_LISTED]
+                + ("" if code is None else f" `{code}`")
+                for path, line, code in places[:_LISTED]
             ]
             if len(places) > _LISTED:
                 shown.append(f"- and {len(places) - _LISTED} more")
@@ -984,7 +989,7 @@ class _Assistant:
 
         parts = [f"`:{param}` of `{name}`"]
         if passing:
-            given = [(one.path, one.line, one.value) for one in passing]
+            given = [(one.path, one.line, one.code) for one in passing]
             parts.append(f"Passed by {len(passing)}:\n\n{listed(given)}")
         if silent:
             missing = [(path, line, None) for path, line in silent]
@@ -998,22 +1003,25 @@ class _Assistant:
     ) -> list[Target]:
         """Return where the Python passes the parameter under the offset.
 
-        That is the keyword of each call that names it, or the template's name
-        in a call that passes values it does not name.
+        That is the keyword of each call that names it. Only when none does, it
+        is the code of the calls that pass values they do not name: `values` in
+        `**values`, or a context that is not written out.
         """
         at = self._parameter_at(path, source, offset)
         if at is None:
             return []
         name, found = at
+        passing = self.passes(name, found.group(1))[0]
+        named = [one for one in passing if one.named]
         texts: dict[Path, str] = {}
         targets = []
-        for one in self.passes(name, found.group(1))[0]:
+        for one in named or passing:
             text = texts.get(one.path)
             if text is None:
                 text = texts[one.path] = _read(one.path)
             line = text.count("\n", 0, one.start)
             column = one.start - (text.rfind("\n", 0, one.start) + 1)
-            targets.append(Target(one.path, line, column))
+            targets.append(Target(one.path, line, column, one.end - one.start))
         return targets
 
     def signature(self, source: str, offset: int) -> Signature | None:
@@ -1642,6 +1650,24 @@ class _TemplateCall:
     line: int = 1
     span: tuple[int, int] | None = None
     """Where the template's name is written, without its quotes."""
+    unnamed: tuple[_Keyword, ...] = ()
+    """The code that passes values it does not name: where `values` of
+    `**values` is, and all of it written, or a context's."""
+
+
+def _unnamed(node: ast.expr, written: str, source: str, starts: list[int]) -> _Keyword:
+    """Return code that passes values it does not name, as a keyword with no name."""
+    start = _char_offset(source, starts, node.lineno, node.col_offset)
+    end = _char_offset(
+        source,
+        starts,
+        node.end_lineno or node.lineno,
+        node.end_col_offset or node.col_offset,
+    )
+    code = _code(node, source, starts)
+    # The name the editor selects: the value, or the start of a long one.
+    end = end if source.count("\n", start, end) == 0 else source.find("\n", start)
+    return _Keyword("", start, end, written.format(code), node.lineno)
 
 
 def _code(node: ast.expr, source: str, starts: list[int]) -> str:
@@ -1736,6 +1762,28 @@ def _template_calls(source: str) -> list[_TemplateCall]:
         written = [_named_keys(context, source, starts) for context in contexts]
         for keys in written:
             keywords.extend(keys or ())
+        unnamed = [
+            *(
+                _unnamed(context, "{}", source, starts)
+                for context, keys in zip(node.args[1:2], written, strict=False)
+                if keys is None
+            ),
+            *(
+                _unnamed(keyword.value, "context={}", source, starts)
+                for keyword, keys in zip(
+                    [one for one in node.keywords if one.arg == "context"],
+                    written[len(node.args[1:2]) :],
+                    strict=True,
+                )
+                if keys is None
+            ),
+            *(_unnamed(one, "{}", source, starts) for one in node.args[2:]),
+            *(
+                _unnamed(keyword.value, "**{}", source, starts)
+                for keyword in node.keywords
+                if keyword.arg is None
+            ),
+        ]
         named = node.args[0]
         value = str(named.value) if isinstance(named, ast.Constant) else ""
         span = None
@@ -1746,13 +1794,7 @@ def _template_calls(source: str) -> list[_TemplateCall]:
             span = None if quote < 0 else (quote, quote + len(value))
         found.append(
             _TemplateCall(
-                value,
-                tuple(keywords),
-                any(keys is None for keys in written)
-                or len(node.args) > 2  # noqa: PLR2004 - the name and a context
-                or any(keyword.arg is None for keyword in node.keywords),
-                node.lineno,
-                span,
+                value, tuple(keywords), bool(unnamed), node.lineno, span, tuple(unnamed)
             )
         )
     return found
@@ -2245,8 +2287,11 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             return None
         places = []
         for one in targets:
-            start = types.Position(one.line, _utf16_column(one))
-            places.append((one.path.resolve().as_uri(), types.Range(start, start)))
+            start, end = _utf16_columns(one)
+            place = types.Range(
+                types.Position(one.line, start), types.Position(one.line, end)
+            )
+            places.append((one.path.resolve().as_uri(), place))
         span = found.helper.origin(
             found.source, found.offset, python=found.python, path=path
         )
@@ -2626,13 +2671,24 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
 
 def _utf16_column(target: Target) -> int:
     """Return a target's column in the UTF-16 units the protocol counts in."""
-    if not target.column:
-        return 0
+    return _utf16_columns(target)[0]
+
+
+def _utf16_columns(target: Target) -> tuple[int, int]:
+    """Return where a target starts and ends on its line, in UTF-16 units."""
+    end = target.column + target.length
+    if not end:
+        return 0, 0
     try:
         line = _lines(target.path, target.path.stat().st_mtime_ns)[target.line]
     except (OSError, IndexError):
-        return target.column
-    return len(line[: target.column].encode("utf-16-le")) // 2
+        return target.column, end
+    if line.isascii():
+        return target.column, end
+    units = [
+        len(line[:column].encode("utf-16-le")) // 2 for column in (target.column, end)
+    ]
+    return units[0], units[1]
 
 
 @lru_cache(maxsize=64)
