@@ -1256,6 +1256,32 @@ def test_a_macro_of_the_project_renders_in_its_own_python(
     )
 
 
+def test_a_file_macro_renders_the_macros_its_sql_calls(project: Path) -> None:
+    _venv(project)
+    (project / "team_macros.py").write_text(
+        "from sqlakit.sql import Param, Sql, sql_macro\n\n\n"
+        '@sql_macro("team.sql")\n'
+        "def of_team(u: Sql, team: Param) -> dict:\n"
+        '    """Rows of the team."""\n'
+        '    return {"team_id": team.value}\n'
+    )
+    (project / "team.sql").write_text(
+        "SELECT tpl.mine(:team_id) AND tpl.if_set(:team_id, u.x = :team_id)"
+        " AS of_team\nFROM u;\n"
+    )
+    helper = _Assistant(load_project(project))
+    rows = project / "sql" / "rows.sql"
+    rows.write_text("SELECT * FROM users AS u WHERE tpl.of_team(u, :team)")
+
+    rendered = helper.rendered(rows, rows.read_text())
+
+    assert rendered == (
+        "-- rows.sql on postgresql\n"
+        "SELECT * FROM users AS u WHERE "
+        "(team IN :of_team_1__team_id AND u.x = :of_team_1__team_id)\n"
+    )
+
+
 def test_a_macro_that_cannot_be_imported_says_why(
     assistant: _Assistant, project: Path
 ) -> None:

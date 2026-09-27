@@ -902,11 +902,15 @@ class _Assistant:
             return f"-- {name} cannot be written with made-up values.\n"
         namespace = self.project.templates.namespace
         # A call of an included template is in the SQL too, and not in `calls`.
-        kept = {
+        static = {
             key: macro
             for key, macro in self.project.templates.macros.items()
             if isinstance(macro, StaticMacro)
-            and re.search(rf"(?<![\w.]){namespace}\.{key}\s*\(", sql, re.IGNORECASE)
+        }
+        kept = {
+            key: macro
+            for key, macro in static.items()
+            if re.search(rf"(?<![\w.]){namespace}\.{key}\s*\(", sql, re.IGNORECASE)
         }
         if not kept:
             return f"-- {name} on {dialect}\n{sql}\n"
@@ -915,8 +919,9 @@ class _Assistant:
             "name": name,
             "source": source,
             "dialect": dialect,
-            "modules": sorted({str(macro.path) for macro in kept.values()}),
-            "macros": sorted(kept),
+            # Every one, as a macro may call another inside, as a file macro's SQL does.
+            "modules": sorted({str(macro.path) for macro in static.values()}),
+            "macros": sorted(static),
             "not_given": sorted(key for key, value in values.items() if value is None),
         }
         run, problem = _run_live(self.project.root, request)
