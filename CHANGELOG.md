@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 - A macro call written on several lines, `tpl.order_by(` with a column on
   each line after it, renders in **Show rendered SQL** and in its hover. A
