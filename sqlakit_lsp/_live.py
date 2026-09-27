@@ -49,6 +49,7 @@ def _module(path: Path) -> tuple[Path, str]:
 def _preparer(dialect: str) -> Any:  # noqa: ANN401
     import sqlalchemy as sa  # noqa: PLC0415
     import sqlalchemy.engine.default  # noqa: PLC0415
+    import sqlalchemy.exc  # noqa: PLC0415
 
     try:
         return sa.engine.make_url(f"{dialect}://").get_dialect()().identifier_preparer
