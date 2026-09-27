@@ -1293,6 +1293,25 @@ def test_a_parameter_a_macro_cannot_take_made_up_renders_as_not_given(
     )
 
 
+def test_a_template_renders_with_a_question_mark_for_each_parameter(
+    assistant: _Assistant, project: Path
+) -> None:
+    marks = project / "sql" / "marks.sql"
+    marks.write_text(
+        "SELECT ':not', x::int FROM t -- :nor\n"
+        "WHERE id IN (:ids) AND tpl.if_set(:q, name = :q) LIMIT :size"
+    )
+
+    rendered = assistant.rendered_marked(marks, marks.read_text())
+
+    assert rendered == (
+        "-- marks.sql on postgresql\n"
+        "-- ? in order: :ids, :q, :size\n"
+        "SELECT ':not', x::int FROM t -- :nor\n"
+        "WHERE id IN (?) AND name = ? LIMIT ?\n"
+    )
+
+
 @pytest.mark.anyio
 async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
     from lsprotocol import types
@@ -1333,16 +1352,21 @@ async def test_the_rendered_template_opens_in_the_editor(project: Path) -> None:
             types.CodeActionContext(diagnostics=[]),
         )
     )
-    assert [action.title for action in actions or []] == ["Show rendered SQL"]
-    await client.workspace_execute_command_async(
-        types.ExecuteCommandParams(RENDER, [uri])
-    )
+    assert [action.title for action in actions or []] == [
+        "Show rendered SQL",
+        "Show rendered SQL with ?",
+    ]
+    for marked in (False, True):
+        await client.workspace_execute_command_async(
+            types.ExecuteCommandParams(RENDER, [uri, marked])
+        )
 
-    [opened] = shown
-    written = Path(unquote(urlparse(opened).path))
-    assert written.name == "good.sql"
-    text = await asyncio.to_thread(written.read_text)
-    assert text.startswith("-- good.sql on postgresql\n")
+    written = [Path(unquote(urlparse(opened).path)) for opened in shown]
+    assert [one.name for one in written] == ["good.sql", "good.sql"]
+    plain, marked = [await asyncio.to_thread(one.read_text) for one in written]
+    assert plain.startswith("-- good.sql on postgresql\n")
+    assert ":teams" in plain
+    assert marked.startswith("-- good.sql on postgresql\n-- ? in order: :teams")
     await client.shutdown_async(None)
     client.exit(None)
     await client.stop()
@@ -1394,7 +1418,14 @@ async def test_the_rendered_template_is_an_edit_for_an_editor_that_opens_none(
     chosen = types.CodeAction(title="Show rendered SQL", data={"uri": uri})
     resolved = await client.code_action_resolve_async(chosen)
 
-    assert [action.title for action in actions or []] == ["Show rendered SQL"]
+    assert [
+        (action.title, action.data)
+        for action in actions or []
+        if isinstance(action, types.CodeAction)
+    ] == [
+        ("Show rendered SQL", {"uri": uri, "marked": False}),
+        ("Show rendered SQL with ?", {"uri": uri, "marked": True}),
+    ]
     assert resolved.edit is not None
     made, filled = resolved.edit.document_changes or []
     assert isinstance(made, types.CreateFile)
@@ -1690,6 +1721,7 @@ async def test_a_quick_fix_comes_with_the_problem_it_fixes(project: Path) -> Non
     assert [action.title for action in actions or []] == [
         "Write `tpl.if_set`",
         "Show rendered SQL",
+        "Show rendered SQL with ?",
     ]
     await client.shutdown_async(None)
     client.exit(None)

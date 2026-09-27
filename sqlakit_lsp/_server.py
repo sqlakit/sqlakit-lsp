@@ -159,6 +159,11 @@ def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
     return None
 
 
+_BOUND = re.compile(
+    rf"{_LITERAL}|(?<![:\w\\]):(?P<bound>[A-Za-z_]\w*)(?![\w:])", re.DOTALL
+)
+"""A placeholder of rendered SQL, and the strings and comments to skip."""
+
 _LIVE = Path(__file__).with_name("_live.py")
 """The script the project's interpreter renders a template with."""
 
@@ -383,6 +388,9 @@ _WORD = re.compile(r"\w+")
 
 SHOW = "Show rendered SQL"
 """The title of the action that shows a whole template as SQL."""
+
+SHOW_MARKED = "Show rendered SQL with ?"
+"""The title of the action that shows it with `?` for each parameter."""
 
 RENDER = "sqlakit.render"
 """The command that writes a whole template as SQL, for an editor to open."""
@@ -916,6 +924,29 @@ class _Assistant:
             return f"-- {name} on {dialect}\n{run}\n"
         listed = ", ".join(f"{namespace}.{key}" for key in sorted(kept))
         return f"-- {name} on {dialect}\n-- {listed} stays a call: {problem}\n{sql}\n"
+
+    def rendered_marked(self, path: Path, source: str) -> str:
+        """Return the rendered template with `?` for each parameter, in order.
+
+        A comment on top lists what each `?` stands for, as a driver that
+        takes `?` is given the values in that order.
+        """
+        text = self.rendered(path, source)
+        names: list[str] = []
+
+        def marked(found: re.Match[str]) -> str:
+            name = found.group("bound")
+            if name is None:
+                return found.group(0)
+            names.append(name)
+            return "?"
+
+        text = _BOUND.sub(marked, text)
+        if not names:
+            return text
+        first, _, rest = text.partition("\n")
+        listed = ", ".join(f":{name}" for name in names)
+        return f"{first}\n-- ? in order: {listed}\n{rest}"
 
     def _not_given(
         self, name: str, source: str, calls: Sequence[Any], dialect: str
@@ -2568,21 +2599,30 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         support = None if action is None else action.resolve_support
         return bool(support is not None and "edit" in support.properties)
 
-    def rendered_file(ls: LanguageServer, uri: str) -> tuple[Path, str]:
+    def rendered_file(
+        ls: LanguageServer, uri: str, *, marked: bool = False
+    ) -> tuple[Path, str]:
         """Return a new file for the rendered template, and what goes in it."""
         helper = assistant()
         path = _path(uri)
         source = ls.workspace.get_text_document(uri).source
         name = helper.project.name_of(path) or path.name if helper else path.name
-        text = helper.rendered(path, source) if helper else ""
+        if helper is None:
+            text = ""
+        elif marked:
+            text = helper.rendered_marked(path, source)
+        else:
+            text = helper.rendered(path, source)
         # A new file each time: the editor may still hold the one before.
         written = _RENDERED / uuid.uuid4().hex[:8] / name
         written.parent.mkdir(parents=True, exist_ok=True)
         return written, text
 
-    def rendered_edit(ls: LanguageServer, uri: str) -> types.WorkspaceEdit:
+    def rendered_edit(
+        ls: LanguageServer, uri: str, *, marked: bool = False
+    ) -> types.WorkspaceEdit:
         """Return an edit that makes the file of the rendered template."""
-        written, text = rendered_file(ls, uri)
+        written, text = rendered_file(ls, uri, marked=marked)
         target = written.as_uri()
         start = types.Position(0, 0)
         return types.WorkspaceEdit(
@@ -2616,14 +2656,18 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
             return actions or None
         if not path.name.endswith(".sql"):
             return actions or None
-        action = types.CodeAction(title=SHOW, kind=types.CodeActionKind.Empty)
-        if shows_documents(ls):
-            action.command = types.Command(title=SHOW, command=RENDER, arguments=[uri])
-        elif resolves_edits(ls):
-            action.data = {"uri": uri}
-        else:
-            action.edit = rendered_edit(ls, uri)
-        return [*actions, action]
+        for title, marked in ((SHOW, False), (SHOW_MARKED, True)):
+            action = types.CodeAction(title=title, kind=types.CodeActionKind.Empty)
+            if shows_documents(ls):
+                action.command = types.Command(
+                    title=title, command=RENDER, arguments=[uri, marked]
+                )
+            elif resolves_edits(ls):
+                action.data = {"uri": uri, "marked": marked}
+            else:
+                action.edit = rendered_edit(ls, uri, marked=marked)
+            actions.append(action)
+        return actions
 
     def fixes(ls: LanguageServer, params: Any) -> list[types.CodeAction]:  # noqa: ANN401
         """Return a quick fix for each problem of ours the editor sends along.
@@ -2666,13 +2710,15 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         """Work out the edit of an action once the editor has chosen it."""
         data = action.data or {}
         if "uri" in data:
-            action.edit = rendered_edit(ls, data["uri"])
+            action.edit = rendered_edit(
+                ls, data["uri"], marked=bool(data.get("marked"))
+            )
         return action
 
     @server.command(RENDER)
-    async def render(ls: LanguageServer, uri: str) -> None:
+    async def render(ls: LanguageServer, uri: str, marked: bool = False) -> None:  # noqa: FBT001, FBT002 - a command's arguments come in order
         """Write the rendered template to a file, and have the editor open it."""
-        written, text = rendered_file(ls, uri)
+        written, text = rendered_file(ls, uri, marked=marked)
         written.write_text(text, encoding="utf-8")
         await ls.window_show_document_async(
             types.ShowDocumentParams(written.as_uri(), take_focus=True)

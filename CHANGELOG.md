@@ -12,6 +12,8 @@
   runs the project's code, and only when the template calls such a macro.
   Without a `.venv`, or when a module fails to import, the call stays a call
   and a comment on top says why.
+- **Show rendered SQL with ?** writes a `?` for each parameter, and a comment
+  on top lists them in order: `-- ? in order: :teams, :page_size`.
 
 ## 0.3.0
 
