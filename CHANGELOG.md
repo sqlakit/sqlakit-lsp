@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The file `@sql_macro("tenant.sql")` names is a link to that SQL, next to
+  the module, and go to definition on it opens the file.
+
 ## 0.1.2
 
 - Go to definition on a built-in macro opens the `sqlakit` in the project's

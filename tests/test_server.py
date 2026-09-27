@@ -683,6 +683,24 @@ def test_the_sql_of_a_file_macro_finds_its_calls(project: Path) -> None:
     assert places(project, found) == [("sql/team.sql", "of_team")]
 
 
+def test_the_file_a_file_macro_names_is_a_link(project: Path) -> None:
+    module = project / "tenant_macros.py"
+    module.write_text(FILE_MACRO)
+    (project / "tenant.sql").write_text(
+        "SELECT row.team_id = :team_id AS of_team FROM row;\n"
+    )
+    assistant = _Assistant(load_project(project))
+    at = FILE_MACRO.index("tenant.sql") + 2
+
+    [(start, end, target)] = assistant.links(module, FILE_MACRO)
+
+    assert (FILE_MACRO[start:end], target) == ("tenant.sql", project / "tenant.sql")
+    assert assistant.python_definition(FILE_MACRO, at, module) == Target(
+        project / "tenant.sql", 0
+    )
+    assert assistant.origin(FILE_MACRO, at, python=True, path=module) == (start, end)
+
+
 def test_references_read_a_file_again_only_when_it_changes(
     assistant: _Assistant, project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

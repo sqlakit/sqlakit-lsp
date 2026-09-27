@@ -1050,7 +1050,7 @@ class _Assistant:
             return next(
                 (
                     (start, end)
-                    for start, end, _ in _template_names(source)
+                    for start, end, _ in self._files_named(source, path)
                     if start <= offset <= end
                 ),
                 defined,
@@ -1148,25 +1148,46 @@ class _Assistant:
     def python_definition(
         self, source: str, offset: int, path: Path | None = None
     ) -> Target | None:
-        """Return the template the name under the offset reads.
+        """Return the file the name under the offset reads.
 
-        On the name of a `def` that defines a macro, that is the name itself.
+        That is a template in `db.sql("...")`, or the SQL of a macro in
+        `@sql_macro("...")`. On the name of a `def` that defines a macro, it is
+        the name itself.
         """
-        for start, end, name in _template_names(source):
+        for start, end, found in self._files_named(source, path):
             if start <= offset <= end:
-                found = self.project.path_of(name)
-                return None if found is None else Target(found, 0)
+                return Target(found, 0)
         return None if path is None else self._itself(path, source, offset)
 
+    def _files_named(
+        self, source: str, path: Path | None
+    ) -> list[tuple[int, int, Path]]:
+        """Return each file the Python names, where the name is, and the file.
+
+        A template is looked for under the template directories, and the SQL of
+        `@sql_macro("...")` next to the module, as `sql_macro` reads it.
+        """
+        found = [
+            (start, end, target)
+            for start, end, name in _template_names(source)
+            if (target := self.project.path_of(name)) is not None
+        ]
+        if path is not None:
+            found.extend(
+                (start, end, target)
+                for start, end, name in _sql_macro_files(source)
+                if (target := path.parent / name).is_file()
+            )
+        return found
+
     def links(self, path: Path, source: str) -> list[tuple[int, int, Path]]:
-        """Return each template the text names, where the name is, and its file."""
-        if self.reads_python(path):
-            named = _template_names(source)
-        else:
-            named = [
-                (found.start(1), found.end(1), found.group(1))
-                for found in self._include_path.finditer(source)
-            ]
+        """Return each file the text names, where the name is, and the file."""
+        if path.suffix == ".py":
+            return self._files_named(source, path)
+        named = [
+            (found.start(1), found.end(1), found.group(1))
+            for found in self._include_path.finditer(source)
+        ]
         return [
             (start, end, target)
             for start, end, name in named
@@ -1657,6 +1678,46 @@ def _template_names(source: str) -> list[tuple[int, int, str]]:
         quote = source.find(name.value, start, end)
         if quote >= 0:
             found.append((quote, quote + len(name.value), name.value))
+    return found
+
+
+def _sql_macro_files(source: str) -> list[tuple[int, int, str]]:
+    """Return where `@sql_macro("file.sql")` names its SQL, the quotes left out."""
+    if "sql_macro" not in source:
+        return []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    starts = _line_starts(source)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            if not (isinstance(decorator, ast.Call) and decorator.args):
+                continue
+            func = decorator.func
+            called = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", "")
+            )
+            name = decorator.args[0]
+            if not (
+                called == "sql_macro"
+                and isinstance(name, ast.Constant)
+                and isinstance(name.value, str)
+                and name.value.endswith(".sql")
+                and name.end_lineno is not None
+                and name.end_col_offset is not None
+            ):
+                continue
+            start = _char_offset(source, starts, name.lineno, name.col_offset)
+            end = _char_offset(source, starts, name.end_lineno, name.end_col_offset)
+            quote = source.find(name.value, start, end)
+            if quote >= 0:
+                found.append((quote, quote + len(name.value), name.value))
     return found
 
 
