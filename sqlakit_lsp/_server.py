@@ -157,6 +157,16 @@ def _innermost(parts: Sequence[Any], offset: int) -> Any:  # noqa: ANN401
     return None
 
 
+def _calls(parts: Sequence[Any]) -> Iterator[Any]:
+    """Yield every macro call of a read template, the ones in arguments too."""
+    for part in parts:
+        if isinstance(part, str):
+            continue
+        yield part
+        for argument in part.args:
+            yield from _calls(argument.parts)
+
+
 def _rendered(template: Any, dialect: str, values: dict[str, Any]) -> str | None:  # noqa: ANN401
     """Return the SQL a read template writes for these values, if it can.
 
@@ -815,7 +825,9 @@ class _Assistant:
         """Return the whole template as the database gets it, on the project's dialect.
 
         Every parameter counts as given, so every optional part is there, and
-        stays a placeholder. A call that cannot be made so stays a call.
+        stays a placeholder. A parameter a built-in macro cannot take made up,
+        the column `tpl.order_by` sorts by, counts as not given. A macro of the
+        project's Python stays a call: the server reads it, and does not run it.
         """
         name = self.project.name_of(path) or path.name
         dialect = self.project.dialect or "postgresql"
@@ -823,11 +835,53 @@ class _Assistant:
             template = self.compiled(name, source)
         except SQLAKitError as error:
             return f"-- {name} cannot be read: {error}\n"
-        values = dict.fromkeys(template.parameters(), _Example())
+        calls = list(_calls(template.parts))
+        values: dict[str, Any] = dict.fromkeys(template.parameters(), _Example())
+        values.update(dict.fromkeys(self._not_given(name, source, calls, dialect)))
         sql = _rendered(template, dialect, values)
         if sql is None:
             return f"-- {name} cannot be written with made-up values.\n"
-        return f"-- {name} on {dialect}\n{sql}\n"
+        namespace = self.project.templates.namespace
+        kept = sorted(
+            {
+                f"{namespace}.{call.name}"
+                for call in calls
+                if isinstance(self.project.templates.macros.get(call.name), StaticMacro)
+            }
+        )
+        note = (
+            f"-- {', '.join(kept)}: the project's Python, which the editor does "
+            "not run.\n"
+            if kept
+            else ""
+        )
+        return f"-- {name} on {dialect}\n{note}{sql}\n"
+
+    def _not_given(
+        self, name: str, source: str, calls: Sequence[Any], dialect: str
+    ) -> set[str]:
+        """Return the parameters to render as not given.
+
+        They are those of a call of a built-in macro that cannot be made with a
+        made-up value, and can with none: `:sort` of `tpl.order_by`, whose value
+        must be a column it lists.
+        """
+        found: set[str] = set()
+        for call in calls:
+            if isinstance(self.project.templates.macros.get(call.name), StaticMacro):
+                continue
+            text = source[call.span[0] : call.span[1]]
+            try:
+                alone = self.compiled(name, text)
+            except SQLAKitError:
+                continue
+            names = alone.parameters()
+            given = _rendered(alone, dialect, dict.fromkeys(names, _Example()))
+            if names and given in (None, text.strip()):
+                missing = _rendered(alone, dialect, dict.fromkeys(names))
+                if missing not in (None, text.strip()):
+                    found.update(names)
+        return found
 
     def holds_macros(self, path: Path) -> bool:
         """Whether a file defines macros: SQL macros, or the SQL of a file macro."""

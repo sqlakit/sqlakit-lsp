@@ -1221,8 +1221,27 @@ def test_a_whole_template_renders_with_every_part_and_its_placeholders(
 
     assert rendered == (
         "-- rows.sql on postgresql\n"
+        "-- tpl.mine: the project's Python, which the editor does not run.\n"
         "SELECT * FROM (VALUES (:rows__1)) AS v WHERE name = :q\n"
         "  AND tpl.mine(:teams)\n"
+    )
+
+
+def test_a_parameter_a_macro_cannot_take_made_up_renders_as_not_given(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "sql" / "sorted.sql").write_text(
+        "SELECT * FROM users WHERE tpl.if_set(:q, name = :q)\n"
+        "ORDER BY tpl.order_by(:sort, id, name, 'id.desc')"
+    )
+    sorted_ = project / "sql" / "sorted.sql"
+
+    rendered = assistant.rendered(sorted_, sorted_.read_text())
+
+    assert rendered == (
+        "-- sorted.sql on postgresql\n"
+        "SELECT * FROM users WHERE name = :q\n"
+        "ORDER BY id DESC\n"
     )
 
 

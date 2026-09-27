@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Show rendered SQL** writes `tpl.order_by(:sort, ...)` as the sort it
+  falls back to, `ORDER BY name ASC`, and not as the call. A parameter a
+  built-in macro cannot take made up renders as not given.
+- A macro of the project's Python stays a call in the rendered SQL, and a
+  comment on top now says so.
+
 ## 0.3.0
 
 - Go to definition on a `:parameter` goes to the calls of Python that pass
