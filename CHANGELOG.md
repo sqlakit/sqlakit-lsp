@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - **Show rendered SQL** writes `tpl.order_by(:sort, ...)` as the sort it
   falls back to, `ORDER BY name ASC`, and not as the call. A parameter a
@@ -10,8 +10,9 @@
   reads those macros and does not run them, so it renders the template again
   with the project's `.venv/bin/python`, which imports them. Only this action
   runs the project's code, and only when the template calls such a macro.
-  Without a `.venv`, or when a module fails to import, the call stays a call
-  and a comment on top says why.
+  A macro a macro calls inside, in a file macro's SQL too, renders at any
+  depth. Without a `.venv`, or when a module fails to import, the call stays
+  a call and a comment on top says why.
 - **Show rendered SQL with ?** writes a `?` for each parameter, and a comment
   on top lists them in order: `-- ? in order: :teams, :page_size`.
 
