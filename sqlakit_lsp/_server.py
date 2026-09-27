@@ -973,11 +973,23 @@ class _Assistant:
                 continue
             names = alone.parameters()
             given = _rendered(alone, dialect, dict.fromkeys(names, _Example()))
-            if names and given in (None, text.strip()):
+            if names and self._kept(given, call.name):
                 missing = _rendered(alone, dialect, dict.fromkeys(names))
-                if missing not in (None, text.strip()):
+                if not self._kept(missing, call.name):
                     found.update(names)
         return found
+
+    def _kept(self, sql: str | None, macro: str) -> bool:
+        """Whether a call rendered alone could not be made, and wrote itself.
+
+        It writes itself on one line, whatever lines it was written on.
+        """
+        if sql is None:
+            return True
+        namespace = re.escape(self.project.templates.namespace)
+        return bool(
+            re.match(rf"{namespace}\.{re.escape(macro)}\s*\(", sql, re.IGNORECASE)
+        )
 
     def holds_macros(self, path: Path) -> bool:
         """Whether a file defines macros: SQL macros, or the SQL of a file macro."""
@@ -1061,7 +1073,7 @@ class _Assistant:
         missing = _rendered(alone, dialect, dict.fromkeys(names))
         # A call that cannot be made writes itself, which says nothing new.
         given, missing = (
-            None if one == text.strip() else one for one in (given, missing)
+            None if self._kept(one, call.name) else one for one in (given, missing)
         )
         if not names or given == missing:
             one = given or missing

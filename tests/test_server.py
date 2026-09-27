@@ -1319,6 +1319,33 @@ def test_a_parameter_a_macro_cannot_take_made_up_renders_as_not_given(
     )
 
 
+def test_a_call_written_on_several_lines_renders_as_one_on_one(
+    assistant: _Assistant, project: Path
+) -> None:
+    source = (
+        "SELECT * FROM users\n"
+        "ORDER BY\n"
+        "    tpl.order_by(\n"
+        "        :sort,\n"
+        "        id,\n"
+        "        name = tpl.icollate(name, 'und-ci-ai'),\n"
+        "        'id.desc'\n"
+        "    )"
+    )
+    sorted_ = project / "sql" / "sorted.sql"
+    sorted_.write_text(source)
+
+    rendered = assistant.rendered(sorted_, source)
+    shown = assistant.hover(source, source.index("order_by"), sorted_)
+
+    assert rendered == (
+        "-- sorted.sql on postgresql\nSELECT * FROM users\nORDER BY\n    id DESC\n"
+    )
+    assert (shown or "").startswith(
+        "`:sort` not given:\n\n```sql\nid DESC\n```\n\n```sql\ntpl.order_by("
+    )
+
+
 def test_a_template_renders_with_a_question_mark_for_each_parameter(
     assistant: _Assistant, project: Path
 ) -> None:

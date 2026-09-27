@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A macro call written on several lines, `tpl.order_by(` with a column on
+  each line after it, renders in **Show rendered SQL** and in its hover. A
+  call that could not be made was taken for SQL, as it comes back on one
+  line.
+
 ## 0.3.1
 
 - **Show rendered SQL** writes `tpl.order_by(:sort, ...)` as the sort it
