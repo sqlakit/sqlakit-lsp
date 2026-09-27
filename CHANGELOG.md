@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - The file `@sql_macro("tenant.sql")` names is a link to that SQL, next to
   the module, and go to definition on it opens the file.
+- A keystroke after a file is made or removed costs a third of what it did:
+  the templates are listed in one walk of the directories. 0.1.2 was meant to
+  ship this and didn't.
 
 ## 0.1.2
 
