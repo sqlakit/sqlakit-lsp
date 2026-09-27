@@ -3,10 +3,13 @@
 ## Unreleased
 
 - Go to definition on a `:parameter` goes to the calls of Python that pass
-  it: to `page_size=` in `db.sql("users/search.sql", page_size=limit)`. A
-  template another includes goes to the calls of that one.
-- The hover of a `:parameter` shows what each call passes, `page_size=limit`,
-  on the line of the keyword.
+  it, and selects `page_size` in `db.sql("users/search.sql",
+  page_size=limit)`. A key of a context written out, `{"page_size": 20}`,
+  counts the same. When no call names it, it goes to the code that may pass
+  it: `values` in `**values`, `ctx` in `context=ctx`. A template another
+  includes goes to the calls of that one.
+- The hover of a `:parameter` shows what each call passes, `page_size=limit`
+  or `**values`, on the line where it is written.
 
 ## 0.2.0
 

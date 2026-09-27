@@ -1452,7 +1452,7 @@ def test_a_parameter_hovers_with_the_calls_that_pass_it(
 
     assert shown == (
         "`:q` of `good.sql`\n\n"
-        'Passed by 2:\n\n- `handlers.py:3` `q="a"`\n- `handlers.py:5`\n\n'
+        'Passed by 2:\n\n- `handlers.py:3` `q="a"`\n- `handlers.py:5` `**values`\n\n'
         "Not passed by 1:\n\n- `handlers.py:4`"
     )
     assert assistant.parameter_hover(good, source, source.index("SELECT")) is None
@@ -1478,14 +1478,106 @@ def test_a_parameter_is_defined_where_the_python_passes_it(
     found = assistant.parameter_definitions(good, source, source.index(":q") + 1)
 
     handlers = project / "handlers.py"
-    assert found == [Target(handlers, 2, 36), Target(handlers, 4, 16)]
+    assert found == [Target(handlers, 2, 36, 1)]
     assert assistant.parameter_definitions(
         inner, inner.read_text(), inner.read_text().index(":q")
-    ) == [Target(handlers, 5, 29)]
+    ) == [Target(handlers, 5, 29, 1)]
     assert assistant.parameter_hover(inner, inner.read_text(), 31) == (
         '`:q` of `inner.sql`\n\nPassed by 1:\n\n- `handlers.py:6` `q="b"`'
     )
     assert assistant.parameter_definitions(good, source, source.index("SELECT")) == []
+
+
+def test_a_parameter_no_call_names_is_defined_where_it_may_be_passed(
+    assistant: _Assistant, project: Path
+) -> None:
+    (project / "handlers.py").write_text(
+        "from db import db\n\n"
+        'two = db.sql("good.sql", teams=[2]).all()\n'
+        'three = db.sql("good.sql", **values).all()\n'
+        'four = db.sql("good.sql", context=ctx).all()\n'
+        'five = db.sql("good.sql", make(\n    1,\n)).all()\n'
+    )
+    assistant.forget_files()
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+
+    found = assistant.parameter_definitions(good, source, source.index(":q"))
+
+    handlers = project / "handlers.py"
+    assert found == [
+        Target(handlers, 3, 29, len("values")),
+        Target(handlers, 4, 34, len("ctx")),
+        Target(handlers, 5, 26, len("make(")),
+    ]
+    assert (assistant.parameter_hover(good, source, source.index(":q")) or "").endswith(
+        "- `handlers.py:4` `**values`\n"
+        "- `handlers.py:5` `context=ctx`\n"
+        "- `handlers.py:6` `make( 1, )`\n\n"
+        "Not passed by 1:\n\n- `handlers.py:3`"
+    )
+
+
+@pytest.mark.anyio
+async def test_a_parameter_links_to_the_keyword_that_passes_it(
+    project: Path,
+) -> None:
+    from lsprotocol import types
+    from pygls.lsp.client import LanguageClient
+
+    code = (
+        "from db import db\n\n"
+        "rows = db.sql(\n"
+        '    "good.sql",\n'
+        "    teams=[1],\n"
+        "    q=text,\n"
+        ").all()\n"
+    )
+    (project / "handlers.py").write_text(code)
+    client = LanguageClient("test", "1")
+    await client.start_io(sys.executable, "-m", "sqlakit_lsp", cwd=str(project))
+    await client.initialize_async(
+        types.InitializeParams(
+            capabilities=types.ClientCapabilities(
+                text_document=types.TextDocumentClientCapabilities(
+                    definition=types.DefinitionClientCapabilities(link_support=True)
+                )
+            ),
+            root_uri=project.as_uri(),
+        )
+    )
+    client.initialized(types.InitializedParams())
+    good = project / "sql" / "good.sql"
+    text = good.read_text()
+    uri = good.as_uri()
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(types.TextDocumentItem(uri, "sql", 1, text))
+    )
+    line = text.count("\n", 0, text.index(":q"))
+    column = text.index(":q") - (text.rfind("\n", 0, text.index(":q")) + 1)
+
+    found = await client.text_document_definition_async(
+        types.DefinitionParams(
+            types.TextDocumentIdentifier(uri), types.Position(line, column + 1)
+        )
+    )
+
+    assert found == [
+        types.LocationLink(
+            target_uri=(project / "handlers.py").resolve().as_uri(),
+            target_range=types.Range(types.Position(5, 4), types.Position(5, 5)),
+            target_selection_range=types.Range(
+                types.Position(5, 4), types.Position(5, 5)
+            ),
+            origin_selection_range=types.Range(
+                types.Position(line, column), types.Position(line, column + 2)
+            ),
+        )
+    ]
+
+    await client.shutdown_async(None)
+    client.exit(None)
+    await client.stop()
 
 
 @pytest.mark.anyio

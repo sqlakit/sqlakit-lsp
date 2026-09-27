@@ -137,6 +137,9 @@ def test_the_requests_an_editor_sends_most_stay_within_budget(
         "parameter_hover": lambda: assistant.parameter_hover(
             template, source, source.index(":a")
         ),
+        "parameter_definition": lambda: assistant.parameter_definitions(
+            template, source, source.index(":a")
+        ),
     }
 
     spent = {name: _median(call) for name, call in requests.items()}
