@@ -9,6 +9,8 @@ templates. In a `.sql` template:
 - on hover, the SQL a call writes, above the macro's signature and docstring
 - go to definition, implementation and references of a macro or a template
 - rename of a macro or a template across the project
+- go to definition of a `:parameter`, to each call of Python that passes it,
+  and on hover, the value each call passes
 - the macros' calls and the parameters coloured
 - a parameter no call of the project passes, marked, with a quick fix for a
   name close to one the calls pass

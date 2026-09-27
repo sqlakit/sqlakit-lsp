@@ -285,6 +285,20 @@ class Reference:
     end: int
 
 
+@dataclass(frozen=True, slots=True)
+class Passing:
+    """A call of Python that passes a template's parameter."""
+
+    path: Path
+    line: int
+    start: int
+    end: int
+    """Where the value is named: its keyword, or the template's name when the
+    call passes values it does not name."""
+    value: str | None
+    """The code of the value, or None when the call does not name it."""
+
+
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -578,6 +592,21 @@ class _Assistant:
         """
         if name in self._passed:
             return self._passed[name]
+        calls = [call for _, call in self._calls_reading(name)]
+        passed = (
+            None
+            if not calls or any(call.open for call in calls)
+            else frozenset(keyword.name for call in calls for keyword in call.keywords)
+        )
+        self._passed[name] = passed
+        return passed
+
+    def _calls_reading(self, name: str) -> list[tuple[Path, _TemplateCall]]:
+        """Return the calls of Python that read a template, and their files.
+
+        A call that reads a template that includes it, however deep, reads it
+        too.
+        """
         included_by = self._included_by()
         readers, waiting = {name}, [name]
         while waiting:
@@ -585,19 +614,12 @@ class _Assistant:
                 if including not in readers:
                     readers.add(including)
                     waiting.append(including)
-        calls = [
-            call
+        return [
+            (path, call)
             for path in self._project_files()[1]
-            for reader in readers
+            for reader in sorted(readers)
             for call in self._scan(path, None).calls.get(reader, ())
         ]
-        passed = (
-            None
-            if not calls or any(call.open for call in calls)
-            else frozenset(keyword for call in calls for keyword, _, _ in call.keywords)
-        )
-        self._passed[name] = passed
-        return passed
 
     def _included_by(self) -> dict[str, set[str]]:
         """Return, for each template, the templates that include it."""
@@ -900,23 +922,36 @@ class _Assistant:
 
     def passes(
         self, name: str, param: str
-    ) -> tuple[list[tuple[Path, int]], list[tuple[Path, int]]]:
+    ) -> tuple[list[Passing], list[tuple[Path, int]]]:
         """Return the calls of Python that pass a template's parameter, and not.
 
-        Each is a file and a line. A call that passes values it does not name,
-        `**values` or a context, counts as one that may pass it.
+        A call that does not pass it is a file and a line. A call that passes
+        values it does not name, `**values` or a context, counts as one that
+        may pass it. The calls of a template that includes this one count too.
         """
         passing, silent = [], []
-        for path in self._project_files()[1]:
-            for call in self._scan(path, None).calls.get(name, ()):
-                named = {keyword for keyword, _, _ in call.keywords}
-                where = (path, call.line)
-                (passing if call.open or param in named else silent).append(where)
+        for path, call in self._calls_reading(name):
+            keyword = next((one for one in call.keywords if one.name == param), None)
+            if keyword is not None:
+                passing.append(
+                    Passing(
+                        path, keyword.line, keyword.start, keyword.end, keyword.value
+                    )
+                )
+            elif call.open:
+                start, end = call.span or (0, 0)
+                passing.append(Passing(path, call.line, start, end, None))
+            else:
+                silent.append((path, call.line))
         return passing, silent
 
-    def parameter_hover(self, path: Path, source: str, offset: int) -> str | None:
-        """Return which calls pass the parameter under the offset, and which not."""
+    def _parameter_at(
+        self, path: Path, source: str, offset: int
+    ) -> tuple[str, re.Match[str]] | None:
+        """Return the template and the `:parameter` under the offset."""
         name = self.project.name_of(path)
+        if name is None:
+            return None
         found = next(
             (
                 match
@@ -925,15 +960,23 @@ class _Assistant:
             ),
             None,
         )
-        if name is None or found is None:
+        return None if found is None else (name, found)
+
+    def parameter_hover(self, path: Path, source: str, offset: int) -> str | None:
+        """Return which calls pass the parameter under the offset, what, and which not."""
+        at = self._parameter_at(path, source, offset)
+        if at is None:
             return None
+        name, found = at
         param = found.group(1)
         passing, silent = self.passes(name, param)
         root = self.project.root
 
-        def listed(places: list[tuple[Path, int]]) -> str:
+        def listed(places: Sequence[tuple[Path, int, str | None]]) -> str:
             shown = [
-                f"- `{_relative(path, root)}:{line}`" for path, line in places[:_LISTED]
+                f"- `{_relative(path, root)}:{line}`"
+                + ("" if value is None else f" `{param}={value}`")
+                for path, line, value in places[:_LISTED]
             ]
             if len(places) > _LISTED:
                 shown.append(f"- and {len(places) - _LISTED} more")
@@ -941,12 +984,37 @@ class _Assistant:
 
         parts = [f"`:{param}` of `{name}`"]
         if passing:
-            parts.append(f"Passed by {len(passing)}:\n\n{listed(passing)}")
+            given = [(one.path, one.line, one.value) for one in passing]
+            parts.append(f"Passed by {len(passing)}:\n\n{listed(given)}")
         if silent:
-            parts.append(f"Not passed by {len(silent)}:\n\n{listed(silent)}")
+            missing = [(path, line, None) for path, line in silent]
+            parts.append(f"Not passed by {len(silent)}:\n\n{listed(missing)}")
         if not passing and not silent:
             parts.append("No call in the project's Python reads this template.")
         return "\n\n".join(parts)
+
+    def parameter_definitions(
+        self, path: Path, source: str, offset: int
+    ) -> list[Target]:
+        """Return where the Python passes the parameter under the offset.
+
+        That is the keyword of each call that names it, or the template's name
+        in a call that passes values it does not name.
+        """
+        at = self._parameter_at(path, source, offset)
+        if at is None:
+            return []
+        name, found = at
+        texts: dict[Path, str] = {}
+        targets = []
+        for one in self.passes(name, found.group(1))[0]:
+            text = texts.get(one.path)
+            if text is None:
+                text = texts[one.path] = _read(one.path)
+            line = text.count("\n", 0, one.start)
+            column = one.start - (text.rfind("\n", 0, one.start) + 1)
+            targets.append(Target(one.path, line, column))
+        return targets
 
     def signature(self, source: str, offset: int) -> Signature | None:
         """Return the macro whose arguments the offset is in, and which one it is."""
@@ -1064,6 +1132,9 @@ class _Assistant:
         for match in self._name_at.finditer(source, start, end):
             if match.start() <= offset <= match.end():
                 return match.span()
+        for match in _PARAMETERS.finditer(source, start, end):
+            if match.start() <= offset <= match.end():
+                return match.span()
         return defined
 
     def reads_python(self, path: Path) -> bool:
@@ -1098,12 +1169,13 @@ class _Assistant:
             listed = ", ".join(f"`{name}`" for name in sorted(reads)) or "nothing"
             found.extend(
                 Diagnostic(
-                    start,
-                    end,
-                    f"`{name}` is not a parameter of `{call.name}`, which reads {listed}.",
+                    keyword.start,
+                    keyword.end,
+                    f"`{keyword.name}` is not a parameter of `{call.name}`, "
+                    f"which reads {listed}.",
                 )
-                for name, start, end in call.keywords
-                if name not in reads
+                for keyword in call.keywords
+                if keyword.name not in reads
             )
         return found
 
@@ -1543,13 +1615,28 @@ _ARGUMENT_TYPED = re.compile(
 _PASSED = re.compile(r"(\w+)\s*=")
 
 
+_SHOWN = 60
+"""The most characters of a value's code a hover shows."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Keyword:
+    """A value a call passes by name, where the name is written, and its code."""
+
+    name: str
+    start: int
+    end: int
+    value: str
+    line: int
+
+
 @dataclass(frozen=True, slots=True)
 class _TemplateCall:
     """A call that reads a template, and the values it passes by name."""
 
     name: str
-    keywords: tuple[tuple[str, int, int], ...]
-    """Each keyword's name, and where it is written."""
+    keywords: tuple[_Keyword, ...]
+    """Each keyword, and where it is written."""
     open: bool
     """Whether it passes values the code does not name: `**values` or a context."""
     line: int = 1
@@ -1557,9 +1644,22 @@ class _TemplateCall:
     """Where the template's name is written, without its quotes."""
 
 
+def _code(node: ast.expr, source: str, starts: list[int]) -> str:
+    """Return the code of an expression on one line, cut short when it is long."""
+    start = _char_offset(source, starts, node.lineno, node.col_offset)
+    end = _char_offset(
+        source,
+        starts,
+        node.end_lineno or node.lineno,
+        node.end_col_offset or node.col_offset,
+    )
+    text = " ".join(source[start:end].split())
+    return text if len(text) <= _SHOWN else f"{text[: _SHOWN - 1]}…"
+
+
 def _named_keys(
     node: ast.expr, source: str, starts: list[int]
-) -> list[tuple[str, int, int]] | None:
+) -> list[_Keyword] | None:
     """Return the keys of a dict written out, and where each is, or None.
 
     None is a context the code does not write out: a name, a call, or a dict
@@ -1568,11 +1668,19 @@ def _named_keys(
     if not isinstance(node, ast.Dict) or any(key is None for key in node.keys):
         return None
     found = []
-    for key in node.keys:
+    for key, value in zip(node.keys, node.values, strict=True):
         if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
             return None
         start = _char_offset(source, starts, key.lineno, key.col_offset) + 1
-        found.append((key.value, start, start + len(key.value)))
+        found.append(
+            _Keyword(
+                key.value,
+                start,
+                start + len(key.value),
+                _code(value, source, starts),
+                key.lineno,
+            )
+        )
     return found
 
 
@@ -1611,7 +1719,15 @@ def _template_calls(source: str) -> list[_TemplateCall]:
             if keyword.arg is None or keyword.arg == "context":
                 continue
             start = _char_offset(source, starts, keyword.lineno, keyword.col_offset)
-            keywords.append((keyword.arg, start, start + len(keyword.arg)))
+            keywords.append(
+                _Keyword(
+                    keyword.arg,
+                    start,
+                    start + len(keyword.arg),
+                    _code(keyword.value, source, starts),
+                    keyword.lineno,
+                )
+            )
         # A context written out as a dict names its values as keywords do.
         contexts = [
             *node.args[1:2],
@@ -2113,26 +2229,37 @@ def _server() -> Any:  # noqa: ANN401, C901, PLR0915 - a handler for each reques
         if found is None:
             return None
         path = _path(params.text_document.uri)
-        target = (
-            found.helper.python_definition(found.source, found.offset, path)
+        if found.python:
+            target = found.helper.python_definition(found.source, found.offset, path)
+        else:
+            target = found.helper.definition(found.source, found.offset, path)
+        # A parameter is defined where the Python passes it, by each call.
+        targets = (
+            [target]
+            if target is not None
+            else []
             if found.python
-            else found.helper.definition(found.source, found.offset, path)
+            else found.helper.parameter_definitions(path, found.source, found.offset)
         )
-        if target is None:
+        if not targets:
             return None
-        start = types.Position(target.line, _utf16_column(target))
-        uri, place = target.path.resolve().as_uri(), types.Range(start, start)
+        places = []
+        for one in targets:
+            start = types.Position(one.line, _utf16_column(one))
+            places.append((one.path.resolve().as_uri(), types.Range(start, start)))
         span = found.helper.origin(
             found.source, found.offset, python=found.python, path=path
         )
         if span is None or not links_supported(ls):
-            return types.Location(uri, place)
+            if len(places) == 1:
+                return types.Location(*places[0])
+            return [types.Location(uri, place) for uri, place in places]
         # A link carries the span it starts from, which the editor underlines.
         origin = types.Range(
             types.Position(*position_of(found.source, span[0])),
             types.Position(*position_of(found.source, span[1])),
         )
-        return [types.LocationLink(uri, place, place, origin)]
+        return [types.LocationLink(uri, place, place, origin) for uri, place in places]
 
     def links_supported(ls: LanguageServer) -> bool:
         """Whether the editor takes a definition as a link with the span it starts from."""
