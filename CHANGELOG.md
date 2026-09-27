@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Go to definition on a `:parameter` goes to the calls of Python that pass
+  it: to `page_size=` in `db.sql("users/search.sql", page_size=limit)`. A
+  template another includes goes to the calls of that one.
+- The hover of a `:parameter` shows what each call passes, `page_size=limit`,
+  on the line of the keyword.
+
 ## 0.2.0
 
 - The file `@sql_macro("tenant.sql")` names is a link to that SQL, next to

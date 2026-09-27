@@ -1452,10 +1452,40 @@ def test_a_parameter_hovers_with_the_calls_that_pass_it(
 
     assert shown == (
         "`:q` of `good.sql`\n\n"
-        "Passed by 2:\n\n- `handlers.py:3`\n- `handlers.py:5`\n\n"
+        'Passed by 2:\n\n- `handlers.py:3` `q="a"`\n- `handlers.py:5`\n\n'
         "Not passed by 1:\n\n- `handlers.py:4`"
     )
     assert assistant.parameter_hover(good, source, source.index("SELECT")) is None
+
+
+def test_a_parameter_is_defined_where_the_python_passes_it(
+    assistant: _Assistant, project: Path
+) -> None:
+    code = (
+        "from db import db\n\n"
+        'one = db.sql("good.sql", teams=[1], q=text.strip()).all()\n'
+        'two = db.sql("good.sql", teams=[2]).all()\n'
+        'three = db.sql("good.sql", **values).all()\n'
+        'four = db.sql("outer.sql", {"q": "b"}).all()\n'
+    )
+    (project / "handlers.py").write_text(code)
+    (project / "sql" / "inner.sql").write_text("SELECT id FROM t WHERE name = :q")
+    assistant.forget_files()
+    good = project / "sql" / "good.sql"
+    source = good.read_text()
+    inner = project / "sql" / "inner.sql"
+
+    found = assistant.parameter_definitions(good, source, source.index(":q") + 1)
+
+    handlers = project / "handlers.py"
+    assert found == [Target(handlers, 2, 36), Target(handlers, 4, 16)]
+    assert assistant.parameter_definitions(
+        inner, inner.read_text(), inner.read_text().index(":q")
+    ) == [Target(handlers, 5, 29)]
+    assert assistant.parameter_hover(inner, inner.read_text(), 31) == (
+        '`:q` of `inner.sql`\n\nPassed by 1:\n\n- `handlers.py:6` `q="b"`'
+    )
+    assert assistant.parameter_definitions(good, source, source.index("SELECT")) == []
 
 
 @pytest.mark.anyio
