@@ -1295,8 +1295,8 @@ def test_a_macro_that_cannot_be_imported_says_why(
 
     assert rendered == (
         "-- rows.sql on postgresql\n"
-        "-- tpl.mine stays a call: lsp_macros cannot be imported: "
-        "No module named 'not_installed'\n"
+        "-- tpl.mine stays a call: the project's macros cannot be imported: "
+        "ModuleNotFoundError: No module named 'not_installed'\n"
         "SELECT * FROM t WHERE tpl.mine(:teams)\n"
     )
 

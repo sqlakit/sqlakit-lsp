@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The server needs `sqlakit` 0.22.4 or newer: it renders a template with
+  `sqlakit`'s own code, the code `sqlakit render` and `sqlakit check --lint`
+  run, where it had a copy of its own.
+
 ## 0.3.2
 
 - A macro call written on several lines, `tpl.order_by(` with a column on

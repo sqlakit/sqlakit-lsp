@@ -37,9 +37,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import sqlakit
-import sqlalchemy as sa
-import sqlalchemy.engine.default
-import sqlalchemy.exc
 from lsprotocol import types
 from pygls.exceptions import JsonRpcException
 from pygls.lsp.server import LanguageServer
@@ -47,11 +44,12 @@ from pygls.protocol import LanguageServerProtocol
 from pygls.protocol.language_server import lsp_method
 from pygls.uris import to_fs_path
 from sqlakit._project import Project, load_project
+from sqlakit._render import Example, _calls, _refused
+from sqlakit._render import _preparer as _dialect_preparer
 from sqlakit._sql import (
     _LITERAL,
     INCLUDE,
     NAMESPACE,
-    Context,
     Macro,
     MacroTemplate,
     Param,
@@ -60,6 +58,7 @@ from sqlakit._sql import (
     signature_of,
     sql_macros,
 )
+from sqlakit._sql import _rendered as _bound
 from sqlakit._static import SKIPPED, StaticMacro, walk
 from sqlakit.exceptions import (
     MacroArgumentError,
@@ -77,29 +76,6 @@ __all__ = ["Completion", "Diagnostic", "Target", "serve"]
 _PARAMETERS = re.compile(r"(?<![:\w\\]):([A-Za-z_]\w*)(?:\.\w+)*")
 """A `:parameter`, with the path read off it, `:criteria.teams`: the group is its
 name, and the match all of it."""
-
-
-class _Example:
-    """A value to render a template with: any path reads another of it.
-
-    `:criteria.teams` and `:filters["kind"]` both read one, so a template
-    renders whatever shape its values have. It writes `x`, and holds one value.
-    """
-
-    def __getattr__(self, _: str) -> _Example:
-        return self
-
-    def __getitem__(self, _: object) -> _Example:
-        return self
-
-    def __iter__(self) -> Iterator[_Example]:
-        return iter((self,))
-
-    def __len__(self) -> int:
-        return 1
-
-    def __str__(self) -> str:
-        return "x"
 
 
 _PARAMETER_TYPED = re.compile(r"(?<![:\w\\]):\w*$")
@@ -209,38 +185,24 @@ def _run_live(root: Path, request: dict[str, Any]) -> tuple[str | None, str]:
     return None, str(answer.get("error", "no SQL came back"))
 
 
-def _calls(parts: Sequence[Any]) -> Iterator[Any]:
-    """Yield every macro call of a read template, the ones in arguments too."""
-    for part in parts:
-        if isinstance(part, str):
-            continue
-        yield part
-        for argument in part.args:
-            yield from _calls(argument.parts)
-
-
 def _rendered(template: Any, dialect: str, values: dict[str, Any]) -> str | None:  # noqa: ANN401
-    """Return the SQL a read template writes for these values, if it can.
+    """Return the SQL a read template writes for these values, as `sqlakit` binds it.
 
     A call that cannot be made with them, such as one of a macro of the
     project's own Python, which is read and not run, stays a call.
     """
     try:
         with calls_kept():
-            return template.render(Context(dialect, _preparer(dialect), values)).strip()
+            sql, _ = _bound(
+                template, {"dialect": dialect, **values}, _preparer(dialect)
+            )
     except Exception:  # noqa: BLE001 - a macro may want a value of its own kind
         return None
+    return sql.strip()
 
 
-@lru_cache
-def _preparer(dialect: str) -> Any:  # noqa: ANN401
-    """Return how a dialect quotes names, loaded without a driver or a server."""
-    try:
-        return sa.engine.make_url(f"{dialect}://").get_dialect()().identifier_preparer
-    except sa.exc.NoSuchModuleError:
-        default = sa.engine.default.DefaultDialect()
-        default.name = dialect
-        return default.identifier_preparer
+_preparer = lru_cache(_dialect_preparer)
+"""How a dialect quotes names, made once for each: a hover renders often."""
 
 
 def _open_brackets(source: str, start: int, end: int) -> list[tuple[int, int]]:
@@ -895,8 +857,9 @@ class _Assistant:
         except SQLAKitError as error:
             return f"-- {name} cannot be read: {error}\n"
         calls = list(_calls(template.parts))
-        values: dict[str, Any] = dict.fromkeys(template.parameters(), _Example())
-        values.update(dict.fromkeys(self._not_given(name, source, calls, dialect)))
+        values: dict[str, Any] = dict.fromkeys(template.parameters(), Example())
+        refused = _refused(self.project, name, source, calls, _preparer(dialect))
+        values.update(dict.fromkeys(refused))
         sql = _rendered(template, dialect, values)
         if sql is None:
             return f"-- {name} cannot be written with made-up values.\n"
@@ -919,9 +882,6 @@ class _Assistant:
             "name": name,
             "source": source,
             "dialect": dialect,
-            # Every one, as a macro may call another inside, as a file macro's SQL does.
-            "modules": sorted({str(macro.path) for macro in static.values()}),
-            "macros": sorted(static),
             "not_given": sorted(key for key, value in values.items() if value is None),
         }
         run, problem = _run_live(self.project.root, request)
@@ -952,32 +912,6 @@ class _Assistant:
         first, _, rest = text.partition("\n")
         listed = ", ".join(f":{name}" for name in names)
         return f"{first}\n-- ? in order: {listed}\n{rest}"
-
-    def _not_given(
-        self, name: str, source: str, calls: Sequence[Any], dialect: str
-    ) -> set[str]:
-        """Return the parameters to render as not given.
-
-        They are those of a call of a built-in macro that cannot be made with a
-        made-up value, and can with none: `:sort` of `tpl.order_by`, whose value
-        must be a column it lists.
-        """
-        found: set[str] = set()
-        for call in calls:
-            if isinstance(self.project.templates.macros.get(call.name), StaticMacro):
-                continue
-            text = source[call.span[0] : call.span[1]]
-            try:
-                alone = self.compiled(name, text)
-            except SQLAKitError:
-                continue
-            names = alone.parameters()
-            given = _rendered(alone, dialect, dict.fromkeys(names, _Example()))
-            if names and self._kept(given, call.name):
-                missing = _rendered(alone, dialect, dict.fromkeys(names))
-                if not self._kept(missing, call.name):
-                    found.update(names)
-        return found
 
     def _kept(self, sql: str | None, macro: str) -> bool:
         """Whether a call rendered alone could not be made, and wrote itself.
@@ -1069,7 +1003,7 @@ class _Assistant:
             return ""
         names = sorted(alone.parameters())
         dialect = self.project.dialect or "postgresql"
-        given = _rendered(alone, dialect, dict.fromkeys(names, _Example()))
+        given = _rendered(alone, dialect, dict.fromkeys(names, Example()))
         missing = _rendered(alone, dialect, dict.fromkeys(names))
         # A call that cannot be made writes itself, which says nothing new.
         given, missing = (
