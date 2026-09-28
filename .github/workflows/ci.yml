@@ -45,4 +45,4 @@ jobs:
       # The lock holds the newest `sqlakit`, and the server still reads the oldest.
       - name: Run tests on the oldest sqlakit
         if: matrix.python == '3.11'
-        run: uv run --with 'sqlakit==0.21.0' pytest
+        run: uv run --with 'sqlakit==0.22.4' pytest
