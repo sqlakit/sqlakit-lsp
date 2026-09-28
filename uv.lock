@@ -380,15 +380,15 @@ wheels = [
 
 [[package]]
 name = "sqlakit"
-version = "0.22.0"
+version = "0.22.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "sqlalchemy" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dd/9e/30d257f78701094faf44cd6bca838525007da640b20940662874cf70502a/sqlakit-0.22.0.tar.gz", hash = "sha256:1e467c1bfeb15bf179928d789e11e1baf45f07bcecf0b397e593f8de00f75154", size = 139901, upload-time = "2026-09-26T09:56:00.215Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/0a/f1b0e9a5ea8e3a86fea68efbd0d453af2d0e49a6eafa8df6961da2b87f72/sqlakit-0.22.5.tar.gz", hash = "sha256:19ed6bd9baf1c76284c0f0c8a07b64e64d8e3eb38e5cf1d1fd08866a1919f709", size = 147825, upload-time = "2026-09-28T11:46:05.83Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/de/c7f61d62eb66131d9d6ef17ec6b17bf3984758e842e497b0106c31f44ab0/sqlakit-0.22.0-py3-none-any.whl", hash = "sha256:255d5b3ab8e622b1b22aff02ca9db4bf12b3fce436d4f32a136dea05cd481709", size = 153683, upload-time = "2026-09-26T09:55:59.021Z" },
+    { url = "https://files.pythonhosted.org/packages/72/38/77cd86afdf8620decb59b0b92ad39bac8c5afadb92d84d6edf03b195a2b4/sqlakit-0.22.5-py3-none-any.whl", hash = "sha256:95ecb93abd8a750811695adc6bfc12f5feec00be3163066623f8551be2e0b5fc", size = 162812, upload-time = "2026-09-28T11:46:04.507Z" },
 ]
 
 [[package]]
@@ -414,7 +414,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pygls", specifier = ">=2.1,<3" },
-    { name = "sqlakit", specifier = ">=0.21.0,<0.23" },
+    { name = "sqlakit", specifier = ">=0.22.4,<0.23" },
 ]
 
 [package.metadata.requires-dev]
