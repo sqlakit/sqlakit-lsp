@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - The server needs `sqlakit` 0.22.4 or newer: it renders a template with
   `sqlakit`'s own code, the code `sqlakit render` and `sqlakit check --lint`
