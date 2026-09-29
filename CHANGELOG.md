@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - A `:parameter` in a file of SQL macros under a template directory,
   `sql/_macros.sql`, hovered as a template's: "No call in the project's
