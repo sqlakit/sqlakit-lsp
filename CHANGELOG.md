@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A `:parameter` in a file of SQL macros under a template directory,
+  `sql/_macros.sql`, hovered as a template's: "No call in the project's
+  Python reads this template". It is an argument of its macro, and has no
+  such hover or definition now.
+
 ## 0.4.0
 
 - The server needs `sqlakit` 0.22.4 or newer: it renders a template with
