@@ -1049,9 +1049,13 @@ class _Assistant:
     def _parameter_at(
         self, path: Path, source: str, offset: int
     ) -> tuple[str, re.Match[str]] | None:
-        """Return the template and the `:parameter` under the offset."""
+        """Return the template and the `:parameter` under the offset.
+
+        A file of SQL macros is no template, even under a template directory:
+        a parameter there is an argument of its macro, which no Python passes.
+        """
         name = self.project.name_of(path)
-        if name is None:
+        if name is None or self.holds_macros(path):
             return None
         found = next(
             (

@@ -1609,6 +1609,21 @@ def test_a_parameter_hovers_with_the_calls_that_pass_it(
     assert assistant.parameter_hover(good, source, source.index("SELECT")) is None
 
 
+def test_a_parameter_of_a_file_of_sql_macros_is_no_template_parameter(
+    project: Path,
+) -> None:
+    macros = project / "sql" / "team_macros.sql"
+    macros.write_text(
+        "-- Rows of the team.\nSELECT t.team = :filters.team AS for_filters FROM t;\n"
+    )
+    helper = _Assistant(load_project(project))
+    source = macros.read_text()
+    at = source.index(":filters") + 1
+
+    assert helper.parameter_hover(macros, source, at) is None
+    assert helper.parameter_definitions(macros, source, at) == []
+
+
 def test_a_parameter_is_defined_where_the_python_passes_it(
     assistant: _Assistant, project: Path
 ) -> None:
